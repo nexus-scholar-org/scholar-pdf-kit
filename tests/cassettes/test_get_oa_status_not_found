@@ -1,0 +1,49 @@
+interactions:
+- request:
+    body: null
+    headers: {}
+    method: GET
+    uri: https://api.unpaywall.org/v2/10.1234/invalid.doi.that.does.not.exist?email=student@university.edu
+  response:
+    body:
+      string: '<!doctype html>
+
+        <html lang=en>
+
+        <title>404 Not Found</title>
+
+        <h1>Not Found</h1>
+
+        <p>The requested URL was not found on the server. If you entered the URL manually
+        please check your spelling and try again.</p>
+
+        '
+    headers:
+      Access-Control-Allow-Headers:
+      - origin, content-type, accept, x-requested-with
+      Access-Control-Allow-Methods:
+      - POST, GET, OPTIONS, PUT, DELETE, PATCH
+      Access-Control-Allow-Origin:
+      - '*'
+      Content-Length:
+      - '207'
+      Content-Type:
+      - text/html; charset=utf-8
+      Date:
+      - Thu, 20 Aug 2026 23:26:22 GMT
+      Nel:
+      - '{"report_to":"heroku-nel","response_headers":["Via"],"max_age":3600,"success_fraction":0.01,"failure_fraction":0.1}'
+      Report-To:
+      - '{"group":"heroku-nel","endpoints":[{"url":"https://nel.heroku.com/reports?s=0dQHH3HP7ra1q2Bair7zB0%2B3fzrjPjk1LfAJvBbpfsc%3D\u0026sid=c46efe9b-d3d2-4a0c-8c76-bfafa16c5add\u0026ts=1787268382"}],"max_age":3600}'
+      Reporting-Endpoints:
+      - heroku-nel="https://nel.heroku.com/reports?s=0dQHH3HP7ra1q2Bair7zB0%2B3fzrjPjk1LfAJvBbpfsc%3D&sid=c46efe9b-d3d2-4a0c-8c76-bfafa16c5add&ts=1787268382"
+      Server:
+      - Heroku
+      Vary:
+      - Accept-Encoding
+      Via:
+      - 1.1 heroku-router
+    status:
+      code: 404
+      message: Not Found
+version: 1
