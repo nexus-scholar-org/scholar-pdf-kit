@@ -1,64 +1,49 @@
-# API Reference
+# Scholar PDF Kit: API Reference
 
-This document outlines the programmatic interfaces available within `scholar-pdf-kit` for developers integrating the toolkit into custom Python pipelines.
+This document provides the API contracts for the core components of `scholar-pdf-kit`.
 
 ## `AsyncPDFDownloader`
+The core asynchronous downloader that takes DOIs, queries OpenAlex for Open Access locations, and concurrently downloads the PDFs using `aiohttp`.
 
-The core class responsible for orchestrating concurrent PDF downloads and metadata resolution.
-
-### Import Path
 ```python
+import asyncio
+from pathlib import Path
 from scholar_pdf.downloader import AsyncPDFDownloader
+
+async def download_papers():
+    output_dir = Path("./my_pdfs")
+    downloader = AsyncPDFDownloader(output_dir=output_dir)
+    
+    dois = ["10.1234/example1", "10.1234/example2"]
+    
+    # download_batch automatically sets up the aiohttp ClientSession
+    results = await downloader.download_batch(dois)
+    
+    for res in results:
+        print(f"{res.doi} -> Success: {res.success}, Path: {res.file_path}")
+
+asyncio.run(download_papers())
 ```
-
-### Initialization
-```python
-def __init__(self, output_dir: Optional[Path] = None):
-```
-- **`output_dir`** (`Path`, optional): The directory where successfully validated PDFs will be saved. Defaults to `downloads/` or the path specified in `.env`.
-
-### Methods
-
-#### `process_doi`
-```python
-async def process_doi(self, session: aiohttp.ClientSession, http_client: AcademicHttpClient, doi: str) -> DownloadResult:
-```
-Resolves the Open Access status of a given DOI via OpenAlex and downloads the PDF if available.
-- **Parameters:**
-  - `session` (`aiohttp.ClientSession`): An active asynchronous HTTP session for streaming binary PDF data.
-  - `http_client` (`AcademicHttpClient`): The synchronous caching HTTP client from `scholar-search-kit` used for rate-limited metadata resolution.
-  - `doi` (`str`): The target Digital Object Identifier.
-- **Returns:** A `DownloadResult` dataclass instance.
-
-#### `download_batch`
-```python
-async def download_batch(self, dois: list[str]) -> list[DownloadResult]:
-```
-Processes an array of DOIs concurrently.
-- **Parameters:**
-  - `dois` (`list[str]`): An array of DOIs.
-- **Returns:** A list of `DownloadResult` instances.
-
----
 
 ## `DownloadResult`
+A dataclass returned by `download_batch` or `process_doi` containing the resolution status of a DOI.
 
-A dataclass representing the final state of a retrieval attempt.
-
-### Attributes
-- **`doi`** (`str`): The requested DOI.
-- **`success`** (`bool`): Indicates if the PDF was successfully downloaded and validated.
-- **`file_path`** (`Optional[Path]`): The local file path to the PDF (if successful).
-- **`error_message`** (`Optional[str]`): Explanatory text if the retrieval failed (e.g., "Not Open Access").
-- **`was_oa`** (`bool`): Indicates if OpenAlex reported the document as Open Access, regardless of whether the physical download succeeded.
-
----
-
-## Validation Utility
-
-### `clean_invalid_pdf`
 ```python
-def clean_invalid_pdf(file_path: Path) -> bool:
+@dataclass
+class DownloadResult:
+    doi: str
+    success: bool
+    file_path: Optional[Path] = None
+    error_message: Optional[str] = None
+    was_oa: bool = False
 ```
-Inspects the file signature (magic bytes) to guarantee the downloaded file is a valid PDF structure (`%PDF-`). Deletes the file if invalid.
-- **Returns:** `True` if valid, `False` if invalid and deleted.
+
+## `OAResult` & `OALocation`
+Pydantic v2 models representing the OpenAlex metadata schema (which mirrors the Unpaywall data standard).
+
+```python
+from scholar_pdf.models import OAResult
+
+# Automatically extracts the best PDF url from the OpenAlex JSON metadata
+pdf_url = oa_result.best_pdf_url
+```

@@ -1,74 +1,48 @@
-# Scholar PDF Kit Tutorial
+# Scholar PDF Kit: Tutorial
 
-This tutorial provides a step-by-step walkthrough of utilizing the `scholar-pdf-kit` CLI to resolve Open Access (OA) metadata and retrieve academic PDFs.
+This tutorial demonstrates how to use `scholar-pdf-kit` to automatically bypass academic paywalls and discover Open Access (OA) PDFs for a list of DOIs.
 
-## Prerequisites
-Ensure the toolkit is installed in your local environment.
+## Command Line Interface
 
-```bash
-cd scholar-pdf-kit
-uv pip install -e .
-```
-
-## 1. Single Document Retrieval
-
-The most direct way to use the toolkit is by supplying a single Digital Object Identifier (DOI). 
-
-### Scenario A: Open Access Exists
-Let's attempt to retrieve a known Open Access publication from PLOS Biology.
+### 1. Download specific DOIs
+You can explicitly provide DOIs to download. 
 
 ```bash
-uv run scholar-pdf --doi 10.1371/journal.pbio.3000246
+scholar-pdf download -d 10.1038/s41586-020-2649-2 -d 10.1126/science.12345 --output ./my_pdfs
 ```
 
-**Expected Output:**
-The system queries OpenAlex, identifies the Open Access PDF endpoint, and downloads the file to the `downloads/` directory.
-```text
-Starting download process for 1 DOIs...
-Downloading PDFs... ---------------------------------------- 100%
-                  Download Summary                  
-+------------------------------------+-----------+-----------------------------------------------+
-| DOI                                | Status    | Details                                       |
-|------------------------------------+-----------+-----------------------------------------------|
-| 10.1371/journal.pbio.3000246       | Success   | downloads/10.1371_journal.pbio.3000246.pdf    |
-+------------------------------------+-----------+-----------------------------------------------+
-Successfully downloaded 1/1 PDFs.
-```
-
-### Scenario B: Paywalled / No Open Access
-Now let's attempt to retrieve an older, paywalled publication from Nature.
+### 2. Download from a JSON file (Integration)
+The kit is designed to seamlessly integrate with `scholar-search-kit`. If you exported search results as a JSON file, you can pass it directly:
 
 ```bash
-uv run scholar-pdf --doi 10.1038/35057062
+scholar-pdf download -i search_results.json --output ./my_pdfs
 ```
+The CLI automatically parses the JSON, extracts any DOIs found inside, and attempts to download the Open Access PDFs.
 
-**Expected Output:**
-The system determines via OpenAlex that no legal Open Access PDF exists. It terminates gracefully without attempting to bypass illegal paywalls.
-```text
-Starting download process for 1 DOIs...
-Downloading PDFs... ---------------------------------------- 100%
-                  Download Summary                  
-+--------------------+-----------+-----------------+
-| DOI                | Status    | Details         |
-|--------------------+-----------+-----------------|
-| 10.1038/35057062   | Paywalled | Not Open Access |
-+--------------------+-----------+-----------------+
-Successfully downloaded 0/1 PDFs.
-```
-
-## 2. Bulk Retrieval via JSON Pipeline
-
-For systematic literature reviews, DOIs are rarely processed one by one. The `scholar-pdf-kit` is designed to ingest JSON output directly from the `scholar-search-kit`.
-
-Suppose you have generated a `results.json` file containing metadata for 50 papers.
-
+### 3. Concurrency Limits
+To avoid overloading network interfaces or exceeding IO limits, set the maximum concurrent downloads:
 ```bash
-uv run scholar-pdf --input results.json --output ./literature_review_pdfs --max-concurrent 10
+scholar-pdf download -d 10.1234/test -c 10
 ```
 
-**Key Parameters:**
-- `--input`: Parses the JSON array and extracts all valid DOIs.
-- `--output`: Redirects the retrieved PDFs to a designated project folder.
-- `--max-concurrent`: Increases the asynchronous download limit to 10 simultaneous connections, drastically reducing total retrieval time.
+## Python API
 
-The resulting table will summarize which PDFs were successfully retrieved and which remain locked behind paywalls, allowing researchers to prioritize their reading accordingly.
+You can script your own concurrent download pipelines:
+
+```python
+import asyncio
+from scholar_pdf.downloader import AsyncPDFDownloader
+
+async def main():
+    dois = ["10.1038/s41586-020-2649-2"]
+    downloader = AsyncPDFDownloader()
+    
+    results = await downloader.download_batch(dois)
+    for r in results:
+        if r.success:
+            print(f"Downloaded: {r.file_path}")
+        else:
+            print(f"Failed {r.doi}: {r.error_message}")
+
+asyncio.run(main())
+```
