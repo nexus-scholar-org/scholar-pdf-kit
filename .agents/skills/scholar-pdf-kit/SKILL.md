@@ -1,82 +1,91 @@
 ---
 name: scholar-pdf-kit
-description: Instructions for using the scholar-pdf-kit Python API and CLI to download Open Access PDFs.
+description: Instructions for using the scholar-pdf-kit Python API and CLI to discover, download, validate, and extract Open Access PDFs.
 ---
 
 # `scholar-pdf-kit` Skill Instructions
 
-You are an expert agent equipped with the `scholar-pdf-kit`. This toolkit allows you to legally bypass academic paywalls by fetching Open Access PDFs using the OpenAlex API infrastructure.
+You are an expert academic research agent equipped with `scholar-pdf-kit`. This toolkit automatically resolves DOIs to legal Open Access PDFs via OpenAlex and Unpaywall, validates binary integrity, and extracts structured text.
 
 ## Core Capabilities
-1. **Resolve DOIs**: Determine if a DOI has a legal, free PDF available.
-2. **Download PDFs**: Concurrently download PDFs while avoiding publisher HTML paywall traps.
-3. **Integration**: Consume JSON output from `scholar-search-kit` to bulk-download literature.
+1. **Open Access DOI Resolution**: Resolve DOIs to direct PDF endpoints across open repositories.
+2. **Concurrent & Resilient Downloading**: Asynchronous retrieval with exponential backoff and paywall HTML redirect rejection.
+3. **Magic Byte Validation**: Verifies binary `%PDF-` signature and removes corrupted or redirected files.
+4. **Smart Naming & Metadata Export**: Formats filenames as `{year}_{author}_{title}.pdf` and exports metadata to JSON or BibTeX.
+5. **Fulltext Extraction**: Converts PDFs to Markdown (Docling) or TEI XML (Grobid).
 
-## How to use the CLI
+---
 
-The primary interface is the `scholar-pdf` command. Ensure you are running it via `uv run` inside the project context or with the package installed.
+## Quick CLI Cheat-Sheet
 
-### 1. Download a single DOI
+All commands should be executed via `uv run`:
+
 ```bash
-uv run scholar-pdf --doi 10.7717/peerj.4375 --output my_pdfs/
+# 1. Download by DOI(s)
+uv run scholar-pdf download --doi 10.1371/journal.pbio.3000246 --output downloads/
+
+# 2. Bulk Download from scholar-search-kit Results with Smart Naming
+uv run scholar-pdf download --input results.json --output downloads/ --smart-names --export json
+
+# 3. Manually Ingest a Local PDF into the Managed Library
+uv run scholar-pdf ingest my_paper.pdf --doi 10.1038/35057062 --smart-names
+
+# 4. Extract Structured Markdown using Docling
+uv run scholar-pdf extract downloads/ --output markdown/ --engine docling
 ```
 
-### 2. Download multiple DOIs
-```bash
-uv run scholar-pdf --doi 10.1234/abc --doi 10.5678/def
-```
+---
 
-### 3. Bulk Download from JSON
-If you previously used `scholar-search-kit` to generate a `results.json` file, you can pass it directly:
-```bash
-uv run scholar-pdf --input results.json --output downloaded_pdfs/
-```
+## Programmatic Python API
 
-## How to use the Python API
+> **CRITICAL RULE**: `AsyncPDFDownloader.download_batch`, `process_doi`, and `ingest_pdf` are asynchronous and must be awaited inside an `asyncio` event loop.
 
-If you need to write a custom Python script to interact with the toolkit programmatically, use the `AsyncPDFDownloader`. 
-
-**Critical Rule:** Because the downloader uses asynchronous `aiohttp`, you must run it inside an `asyncio` event loop.
-
-### Example Script
 ```python
 import asyncio
-import aiohttp
 from pathlib import Path
-from scholar_search.http_client import AcademicHttpClient
 from scholar_pdf.downloader import AsyncPDFDownloader
 
 async def main():
-    dois = ["10.7717/peerj.4375", "10.1371/journal.pbio.3000246"]
-    
-    # 1. Initialize the HTTP Client (from scholar-search-kit) for rate-limiting
-    http_client = AcademicHttpClient(name="openalex-pdf", rate_limit=10)
-    
-    # 2. Initialize the Downloader
-    output_dir = Path("my_downloads")
-    downloader = AsyncPDFDownloader(output_dir=output_dir)
-    
-    # 3. Process the downloads
-    results = []
-    async with aiohttp.ClientSession() as session:
-        tasks = [downloader.process_doi(session, http_client, doi) for doi in dois]
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            results.append(res)
-            
-    # 4. Handle Results
+    dois = [
+        "10.1371/journal.pbio.3000246",
+        "10.7717/peerj.4375"
+    ]
+
+    # 1. Initialize Downloader
+    downloader = AsyncPDFDownloader(
+        output_dir=Path("downloads"),
+        use_smart_names=True
+    )
+
+    # 2. Batch Download (Async)
+    results = await downloader.download_batch(dois)
+
+    # 3. Process Results
     for res in results:
         if res.success:
             print(f"Downloaded: {res.doi} -> {res.file_path}")
         else:
-            print(f"Failed: {res.doi} -> {res.error_message}")
+            print(f"Failed / Paywalled: {res.doi} -> {res.error_message}")
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Agent Guidelines
+---
 
-- **Always verify paths**: When passing `--input` or `--output`, ensure the directories exist or that the tool will create them.
-- **Paywalls**: Not all DOIs are Open Access. If a download fails with "Not Open Access", inform the user that a legal free copy does not exist in the open infrastructure. Do not attempt to scrape proprietary publisher sites.
-- **Dependencies**: `scholar-pdf-kit` natively relies on `scholar-search-kit` for the `AcademicHttpClient`. If writing a Python script, ensure both packages are accessible in the environment.
+## Detailed References
+
+For advanced workflows, underlying mechanisms, and fulltext extraction configurations, read these reference files on demand:
+
+- [OA Resolution & Download Mechanics](references/resolution_and_download.md): OpenAlex/Unpaywall fallback, semaphore concurrency, HTML trap detection, and magic byte validation.
+- [Smart Naming, Ingestion & Export](references/naming_and_ingestion.md): `{year}_{author}_{title}.pdf` format, manual PDF ingestion, and JSON/BibTeX export.
+- [Fulltext Extraction](references/fulltext_extraction.md): Converting PDFs to Markdown via Docling and TEI XML via Grobid.
+- [Pipeline Integration](references/pipeline_integration.md): End-to-end chaining from `scholar-search-kit` to downstream RAG stores.
+
+---
+
+## Agent Guidelines & Best Practices
+
+- **Paywall Recognition**: Not all academic literature is Open Access. If resolution reports `was_oa=False`, clearly inform the user that no legal Open Access copy is available. Do not attempt to bypass commercial paywalls with web scrapers.
+- **Path Verification**: Always verify that target download and extraction directories exist or allow the tool to create them automatically.
+- **Handoff from Search**: When receiving a JSON export from `scholar-search-kit`, pass it directly with `--input <file.json>`.
