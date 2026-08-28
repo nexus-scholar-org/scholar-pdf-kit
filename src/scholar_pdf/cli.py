@@ -8,6 +8,7 @@ from rich.table import Table
 
 from .downloader import AsyncPDFDownloader
 from .config import settings
+from .extract import DoclingEngine, GrobidEngine
 
 app = typer.Typer(help="Scholar PDF Kit: Bypassing paywalls for automated Open Access discovery.")
 console = Console()
@@ -182,6 +183,58 @@ def ingest(
             _export_results(export_format, output_dir, [res])
     else:
         console.print(f"[bold red]Failed to ingest PDF: {res.error_message}[/bold red]")
+
+@app.command("extract")
+def extract(
+    pdf_path: Path = typer.Argument(..., help="Path to the PDF file or directory of PDFs"),
+    output_dir: Path = typer.Option(Path("markdown"), "--output", "-o", help="Directory to save the extracted Markdown"),
+    engine: str = typer.Option("docling", help="Extraction engine: docling or grobid"),
+    grobid_url: str = typer.Option("http://localhost:8070", help="Grobid service URL if using grobid")
+):
+    """Extract raw Markdown from a PDF using Docling or Grobid."""
+    
+    if not pdf_path.exists():
+        console.print(f"[red]Path does not exist: {pdf_path}[/red]")
+        raise typer.Exit(1)
+        
+    pdfs = []
+    if pdf_path.is_file() and pdf_path.suffix.lower() == ".pdf":
+        pdfs.append(pdf_path)
+    elif pdf_path.is_dir():
+        pdfs.extend(list(pdf_path.glob("*.pdf")))
+    else:
+        console.print("[red]Input must be a PDF file or a directory containing PDFs.[/red]")
+        raise typer.Exit(1)
+        
+    if not pdfs:
+        console.print("[yellow]No PDFs found.[/yellow]")
+        raise typer.Exit(0)
+        
+    console.print(f"[bold blue]Extracting {len(pdfs)} PDFs using {engine}...[/bold blue]")
+    
+    success = 0
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+        task = progress.add_task("Extracting...", total=len(pdfs))
+        
+        for pdf in pdfs:
+            progress.update(task, description=f"Extracting {pdf.name}...")
+            try:
+                if engine.lower() == "docling":
+                    out = DoclingEngine.extract_markdown(pdf, output_dir)
+                    console.print(f"[green]Extracted {pdf.name} -> {out}[/green]")
+                elif engine.lower() == "grobid":
+                    out = GrobidEngine.extract_markdown(pdf, output_dir, grobid_url)
+                    console.print(f"[green]Extracted {pdf.name} -> {out}[/green]")
+                else:
+                    console.print(f"[red]Unknown engine: {engine}[/red]")
+                    raise typer.Exit(1)
+                success += 1
+            except Exception as e:
+                console.print(f"[red]Failed to extract {pdf.name}: {e}[/red]")
+            finally:
+                progress.advance(task)
+                
+    console.print(f"[bold green]Successfully extracted {success}/{len(pdfs)} files to {output_dir}.[/bold green]")
 
 if __name__ == "__main__":
     app()

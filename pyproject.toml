@@ -24,6 +24,11 @@ dev = [
     "vcrpy>=5.0.0",
     "pytest-asyncio>=0.21.0"
 ]
+extract = [
+    "docling>=2.5.0",
+    "requests",
+    "lxml"
+]
 
 [project.scripts]
 scholar-pdf = "scholar_pdf.cli:app"
