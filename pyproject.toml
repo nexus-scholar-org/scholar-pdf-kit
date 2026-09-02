@@ -15,7 +15,9 @@ dependencies = [
     "requests>=2.31.0",
     "rich>=13.0.0",
     "tenacity>=8.0.0",
-    "scholar-search-kit @ file:///c:/Users/mouadh/Documents/phd-course-content/tools/scholar-search-kit"
+    "scholar-search-kit",
+    "pypdf>=4.0.0",
+    "pymupdf>=1.24.0"
 ]
 
 [project.optional-dependencies]
@@ -38,3 +40,6 @@ packages = ["src/scholar_pdf"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.uv.sources]
+scholar-search-kit = { path = "../scholar-search-kit", editable = true }

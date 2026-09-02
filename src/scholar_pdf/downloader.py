@@ -53,30 +53,49 @@ class AsyncPDFDownloader:
     )
     async def download_pdf(self, session: aiohttp.ClientSession, url: str, dest_path: Path) -> bool:
         """Downloads a PDF from a URL to a specific path."""
-        headers = {"User-Agent": f"scholar-pdf-kit/0.1.0 (mailto:{settings.mailto})"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/pdf,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         timeout = aiohttp.ClientTimeout(total=settings.download_timeout)
-        
+
         try:
             async with self.semaphore:
                 async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as response:
                     response.raise_for_status()
-                    
-                    # Ensure content type is PDF if provided
+
+                    # Check if the final URL looks like a PDF
+                    final_url = str(response.url)
+                    is_pdf_url = final_url.lower().endswith('.pdf')
+
+                    # Check content type (but don't reject on HTML if URL suggests PDF)
                     content_type = response.headers.get("Content-Type", "").lower()
-                    if "text/html" in content_type:
-                        return False # Hit a paywall or login page
-                        
+                    is_pdf_content_type = "application/pdf" in content_type
+
+                    # Download the content first
                     with open(dest_path, "wb") as f:
                         async for chunk in response.content.iter_chunked(8192):
                             f.write(chunk)
-            
-            # Post-download validation using magic bytes
-            return clean_invalid_pdf(dest_path)
-            
+
+            # Post-download validation using magic bytes - this is the authoritative check
+            # If the file has %PDF- magic bytes, it's a valid PDF regardless of headers
+            if clean_invalid_pdf(dest_path):
+                return True
+
+            # If magic bytes check failed, check if we got HTML (paywall/login page)
+            if dest_path.exists():
+                with open(dest_path, "rb") as f:
+                    header = f.read(100)
+                if b"<html" in header.lower() or b"<!doctype html" in header.lower():
+                    return False  # Definitely an HTML page
+
+            return False
+
         except Exception as e:
             if dest_path.exists():
                 dest_path.unlink()
-            raise e # Let tenacity handle retries
+            raise e  # Let tenacity handle retries
 
     async def fetch_openalex_metadata(self, http_client: AcademicHttpClient, doi: str) -> Optional[dict]:
         url = f"https://api.openalex.org/works/https://doi.org/{doi}"

@@ -73,17 +73,28 @@ Downloading PDFs... ---------------------------------------- 100%
 Successfully downloaded 2/2 PDFs.
 ```
 
-### Bulk Retrieval via JSON
-For systematic literature reviews, integrate directly with `scholar-search-kit` outputs:
+### Bulk Retrieval via JSON / Included Literature
+For systematic literature reviews, integrate directly with `scholar-search-kit` outputs (`included.json` or `results.json`):
 ```bash
-uv run scholar-pdf --input ../slr-search-kit/results.json --output downloaded_pdfs/
+uv run scholar-pdf download --input literature/included.json --output papers/pdfs/ --smart-names
+```
+
+### Manual PDF Ingestion
+If an open-access PDF was obtained manually or from an institutional proxy:
+```bash
+uv run scholar-pdf ingest my_paper.pdf --doi 10.1038/s41586-023-0001 --output papers/pdfs/ --smart-names
+```
+
+### Section-Aware Markdown Extraction
+Convert PDFs into structured Markdown with YAML frontmatter for downstream RAG indexing:
+```bash
+uv run scholar-pdf extract papers/pdfs/ --output papers/extracted/ --engine pymupdf
 ```
 
 ### CLI Arguments Reference
-- `--doi`, `-d`: Target DOI for retrieval (repeatable).
-- `--input`, `-i`: Filepath to a JSON array containing literature metadata.
-- `--output`, `-o`: Target directory for downloaded files (default: `downloads/`).
-- `--max-concurrent`, `-c`: Concurrency limit for active downloads (default: 5).
+- `download`: Download OA PDFs from DOI arguments or candidate JSON files.
+- `ingest`: Safely copy and validate local PDFs with metadata tagging.
+- `extract`: Convert PDFs into structured Markdown with YAML frontmatter.
 
 ## Documentation
 
