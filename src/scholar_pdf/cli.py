@@ -1,14 +1,31 @@
-import typer
 import asyncio
 import json
+import sys
 from pathlib import Path
+
+import typer
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
 from rich.table import Table
 
-from .downloader import AsyncPDFDownloader
+# Force UTF-8 on Windows to prevent Rich console UnicodeEncodeError on OEM code pages
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from .config import settings
+from .downloader import AsyncPDFDownloader
 from .extract import DoclingEngine, GrobidEngine
+from .publisher_patterns import PROXY_STYLES
 
 app = typer.Typer(help="Scholar PDF Kit: Bypassing paywalls for automated Open Access discovery.")
 console = Console()
@@ -69,10 +86,15 @@ def download(
     output_dir: Path = typer.Option(Path("downloads"), "--output", "-o", help="Directory to save PDFs"),
     max_concurrent: int = typer.Option(5, "--max-concurrent", "-c", help="Maximum concurrent downloads"),
     smart_names: bool = typer.Option(False, "--smart-names", help="Rename downloaded PDFs using Author_Year_Title"),
-    export_format: str = typer.Option(None, "--export", help="Export successfully downloaded metadata (json or bibtex)")
+    export_format: str = typer.Option(None, "--export", help="Export successfully downloaded metadata (json or bibtex)"),
+    proxy: str = typer.Option(None, "--proxy", help="Institutional proxy URL (overrides PROXY_URL / .env), e.g. https://www.sndl1.arn.dz"),
+    proxy_style: str = typer.Option("auto", "--proxy-style", help="Proxy style: auto | ezproxy | subdomain | prefix"),
+    strict_validate: bool = typer.Option(False, "--strict-validate", help="Require pypdf structural validation of downloads"),
 ):
     """Resolve DOIs via OpenAlex and download Open Access PDFs."""
     
+    if proxy_style not in PROXY_STYLES:
+        raise typer.BadParameter(f"--proxy-style must be one of {', '.join(PROXY_STYLES)}")
     settings.download_dir = output_dir
     settings.max_concurrent_downloads = max_concurrent
     
@@ -102,8 +124,14 @@ def download(
         
     console.print(f"[bold blue]Starting download process for {len(doi_list)} DOIs...[/bold blue]")
     
-    downloader = AsyncPDFDownloader(output_dir=output_dir, use_smart_names=smart_names)
-    
+    downloader = AsyncPDFDownloader(
+        output_dir=output_dir,
+        use_smart_names=smart_names,
+        proxy_url=proxy,
+        proxy_style=proxy_style,
+        structural_validation=strict_validate,
+    )
+
     async def run_downloads():
         with Progress(
             SpinnerColumn(),
@@ -162,13 +190,24 @@ def ingest(
     doi: str = typer.Option(..., "--doi", "-d", help="The DOI associated with the PDF"),
     output_dir: Path = typer.Option(Path("downloads"), "--output", "-o", help="Directory to save PDFs"),
     smart_names: bool = typer.Option(False, "--smart-names", help="Rename downloaded PDF using Author_Year_Title"),
-    export_format: str = typer.Option(None, "--export", help="Export successfully ingested metadata (json or bibtex)")
+    export_format: str = typer.Option(None, "--export", help="Export successfully ingested metadata (json or bibtex)"),
+    proxy: str = typer.Option(None, "--proxy", help="Institutional proxy URL (overrides PROXY_URL / .env)"),
+    proxy_style: str = typer.Option("auto", "--proxy-style", help="Proxy style: auto | ezproxy | subdomain | prefix"),
+    strict_validate: bool = typer.Option(False, "--strict-validate", help="Require pypdf structural validation on ingest"),
 ):
     """Manually ingest a PDF into the toolkit, bypassing download."""
+    if proxy_style not in PROXY_STYLES:
+        raise typer.BadParameter(f"--proxy-style must be one of {', '.join(PROXY_STYLES)}")
     settings.download_dir = output_dir
     
     console.print(f"[bold blue]Ingesting {pdf_path} for DOI {doi}...[/bold blue]")
-    downloader = AsyncPDFDownloader(output_dir=output_dir, use_smart_names=smart_names)
+    downloader = AsyncPDFDownloader(
+        output_dir=output_dir,
+        use_smart_names=smart_names,
+        proxy_url=proxy,
+        proxy_style=proxy_style,
+        structural_validation=strict_validate,
+    )
     
     async def run_ingest():
         from scholar_search.http_client import AcademicHttpClient
