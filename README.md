@@ -6,14 +6,14 @@
 
 **Scholar PDF Kit** is a Python-based utility designed to automate the discovery and retrieval of Open Access (OA) academic literature.
 
-By leveraging the open scholarly infrastructure provided by [OpenAlex](https://openalex.org/), this toolkit circumvents commercial academic paywalls legally, resolving Digital Object Identifiers (DOIs) directly to their hosted PDF files across university repositories and open archives.
+By using metadata and legally available copies from sources such as [OpenAlex](https://openalex.org/), the toolkit resolves Digital Object Identifiers (DOIs) to authorized or open-access PDF endpoints. It does not infer legal access from an HTTP response or bypass access controls.
 
 ## System Architecture
 
 The package is built with a focus on concurrency and data integrity:
 1. **Resolution**: Queries OpenAlex APIs to determine OA status and locate direct PDF endpoints.
 2. **Concurrent Retrieval**: Utilizes `aiohttp` to manage asynchronous, high-throughput PDF downloads.
-3. **Integrity Validation**: Analyzes downloaded file byte signatures (magic bytes) to ensure successful PDF retrieval and automatically discards HTML paywall redirects.
+3. **Integrity Validation**: Analyzes downloaded file byte signatures and PDF structure to reject incomplete, malformed, encrypted, or non-PDF responses.
 
 ## Installation
 
@@ -26,9 +26,17 @@ git clone https://github.com/mouadh/scholar-pdf-kit.git
 # Navigate to the toolkit directory
 cd scholar-pdf-kit
 
-# Install the package and its dependencies
-uv pip install -e .
+# Install the E1 API/CLI and base dependencies
+uv pip install .
+
+# In the toolkit monorepo, add the legacy search-provider adapter
+uv pip install -e ".[search]"
 ```
+
+The base wheel keeps Contract v1 acquisition, validation, and atomic publication
+self-contained. The deprecated `download`/`ingest` provider paths require the
+optional `search` extra because their HTTP client is owned by
+`scholar-search-kit`.
 
 ## Command Line Interface (CLI)
 
@@ -37,7 +45,7 @@ The package exposes a Typer-based CLI for both targeted and bulk literature retr
 ### Single Document Retrieval
 Provide a DOI directly to the CLI:
 ```bash
-uv run scholar-pdf --doi 10.1371/journal.pbio.3000246
+uv run scholar-pdf download --doi 10.1371/journal.pbio.3000246
 ```
 
 **Example Output:**
@@ -48,7 +56,7 @@ Downloading PDFs... ---------------------------------------- 100%
 +-----------------------------------------------------------------------------+
 | DOI                          | Status  | Details                            |
 |------------------------------+---------+------------------------------------|
-| 10.1371/journal.pbio.3000246 | Success | downloads\10.1371_journal.pbio.30… |
+| 10.1371/journal.pbio.3000246 | Success | downloads/10.1371_journal.pbio.30… |
 +-----------------------------------------------------------------------------+
 Successfully downloaded 1/1 PDFs.
 ```
@@ -56,7 +64,7 @@ Successfully downloaded 1/1 PDFs.
 ### Multiple Document Retrieval
 Chain multiple DOIs within a single command:
 ```bash
-uv run scholar-pdf --doi 10.1371/journal.pbio.3000246 --doi 10.1038/35057062
+uv run scholar-pdf download --doi 10.1371/journal.pbio.3000246 --doi 10.1038/35057062
 ```
 
 **Example Output:**
@@ -67,7 +75,7 @@ Downloading PDFs... ---------------------------------------- 100%
 +-----------------------------------------------------------------------------+
 | DOI                          | Status  | Details                            |
 |------------------------------+---------+------------------------------------|
-| 10.1371/journal.pbio.3000246 | Success | downloads\10.1371_journal.pbio.30… |
+| 10.1371/journal.pbio.3000246 | Success | downloads/10.1371_journal.pbio.30… |
 | 10.1038/35057062             | Success | downloads\10.1038_35057062.pdf     |
 +-----------------------------------------------------------------------------+
 Successfully downloaded 2/2 PDFs.
@@ -85,16 +93,56 @@ If an open-access PDF was obtained manually or from an institutional proxy:
 uv run scholar-pdf ingest my_paper.pdf --doi 10.1038/s41586-023-0001 --output papers/pdfs/ --smart-names
 ```
 
+### Contract v1 parent-bound acquisition (WP01-E1)
+
+The `acquire` API and command are the authoritative path for Contract v1
+research workspaces. They require a canonical `AcquisitionRunConfig`, accepted
+corpus/screening parents, a canonical workspace-root binding, and the
+workspace-manager audit logger. The service verifies the parent lineage before
+writing any artifact, streams into a same-directory staging file, validates the
+bytes, atomically promotes content to `pdfs/acquired/<document_id>.pdf`, and
+then publishes the deterministic acquisition manifest.
+
+```bash
+uv run scholar-pdf acquire acquisition-config.json \
+  --audit-logger /path/to/workspace-manager/scripts/log_event.py
+```
+
+The command emits JSON. Exit codes are `0` for success, `2` for a partial
+batch, `1` for a failed batch, and `130` for cancellation. The manifest records
+`SUCCESS`, `PARTIAL`, `FAILED`, or `CANCELLED`; an unresolved provider result is
+not a paywall determination, and a provider or transport failure is not an
+empty successful result. Content identities are deterministic `DOC-*` identities
+derived from the validated bytes and scoped by workspace and study. Manifests contain
+only workspace-relative POSIX paths, parent hashes, validation results,
+attempts, and redacted source evidence—never absolute paths, credentials, or
+provider tokens.
+
+The programmatic entry point is `PDFAcquisitionService.acquire(...)`; use an
+injected transport and audit sink for hermetic tests. Replaying the same batch
+is idempotent, while a different semantic request in the same run, stale parent
+lineage, changed bound bytes, or path traversal fails closed. `USER_PATH`
+sources are copied only when the researcher has explicitly authorized the
+read-only input; network sources never fabricate legal-access status from a
+successful HTTP response. MCP acquisition is explicitly unsupported in E1; the
+E1 MCP surface must return `UNSUPPORTED_CAPABILITY` until its separately governed
+implementation is available.
+
 ### Section-Aware Markdown Extraction
 Convert PDFs into structured Markdown with YAML frontmatter for downstream RAG indexing:
 ```bash
-uv run scholar-pdf extract papers/pdfs/ --output papers/extracted/ --engine pymupdf
+uv run scholar-pdf extract papers/pdfs/ --output papers/extracted/ --engine docling
 ```
 
 ### CLI Arguments Reference
-- `download`: Download OA PDFs from DOI arguments or candidate JSON files.
-- `ingest`: Safely copy and validate local PDFs with metadata tagging.
-- `extract`: Convert PDFs into structured Markdown with YAML frontmatter.
+- `acquire`: Execute a parent-bound Contract v1 acquisition batch and emit a deterministic manifest.
+- `download`: Legacy DOI/provider retrieval. Files are validated and atomically published under content-addressed `DOC-*` names.
+- `ingest`: Validate and atomically publish a local PDF under a content-addressed name.
+- `extract`: Convert PDFs into structured Markdown with YAML frontmatter (`docling` or `grobid`).
+
+For legacy downloads, `access_status` is the truthful access projection;
+`was_oa` remains only as a deprecated compatibility field. A successful HTTP
+response alone does not establish that a source is open access.
 
 ## Documentation
 

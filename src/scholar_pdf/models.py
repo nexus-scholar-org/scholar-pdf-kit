@@ -1,10 +1,11 @@
-from typing import Optional
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
 
 class OALocation(BaseModel):
     """Represents a specific Open Access location returned by Unpaywall."""
+
     model_config = ConfigDict(extra="ignore")
-    
+
     is_best: bool
     endpoint_id: str | None = None
     evidence: str | None = None
@@ -22,8 +23,9 @@ class OALocation(BaseModel):
 
 class OAResult(BaseModel):
     """The root response object for a DOI from Unpaywall."""
+
     model_config = ConfigDict(extra="ignore")
-    
+
     doi: str
     is_oa: bool
     data_standard: int
@@ -33,18 +35,18 @@ class OAResult(BaseModel):
     journal_is_in_doaj: bool = False
     journal_name: str | None = None
     publisher: str | None = None
-    
-    best_oa_location: Optional[OALocation] = None
+
+    best_oa_location: OALocation | None = None
     oa_locations: list[OALocation] = Field(default_factory=list)
 
     @property
-    def best_pdf_url(self) -> Optional[str]:
+    def best_pdf_url(self) -> str | None:
         """Convenience method to get the best PDF URL."""
         if self.best_oa_location and self.best_oa_location.url_for_pdf:
             return self.best_oa_location.url_for_pdf
-            
+
         # Fallback to checking other locations
-        for loc in self.oa_locations:
-            if loc.url_for_pdf:
-                return loc.url_for_pdf
+        for location in self.oa_locations:
+            if location.url_for_pdf:
+                return location.url_for_pdf
         return None

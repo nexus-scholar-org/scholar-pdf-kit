@@ -2,8 +2,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
-from scholar_pdf.downloader import AsyncPDFDownloader
 from scholar_search.http_client import AcademicHttpClient
+from test_acquisition_contract import pdf_bytes
+
+from scholar_pdf.downloader import AsyncPDFDownloader
 
 
 @pytest.fixture
@@ -57,8 +59,11 @@ async def test_process_doi_success(downloader, mock_http_client, temp_output_dir
     assert result.success is True
     assert result.doi == doi
     assert result.was_oa is True
-    assert result.file_path == temp_output_dir / "10.1234_test.1.pdf"
+    assert result.file_path is not None
+    assert result.file_path.parent == temp_output_dir
+    assert result.file_path.name.startswith("DOC-")
     assert result.file_path.exists()
+    assert result.access_status == "VERIFIED_OPEN_ACCESS"
 
 
 @pytest.mark.asyncio
@@ -77,7 +82,9 @@ async def test_process_doi_not_oa(downloader, mock_http_client):
 
     assert result.success is False
     assert result.was_oa is False
-    assert "Not Open Access" in result.error_message
+    assert result.status == "UNRESOLVED"
+    assert result.access_status == "UNRESOLVED"
+    assert "not a paywall determination" in result.error_message
 
 
 @pytest.mark.asyncio
@@ -93,7 +100,9 @@ async def test_process_doi_not_found(downloader, mock_http_client):
 
     assert result.success is False
     assert result.was_oa is False
-    assert "Not Open Access" in result.error_message
+    assert result.status == "UNRESOLVED"
+    assert result.access_status == "UNRESOLVED"
+    assert "not a paywall determination" in result.error_message
 
 
 @pytest.mark.asyncio
@@ -128,7 +137,9 @@ async def test_process_doi_invalid_pdf(downloader, mock_http_client, temp_output
 
 
 @pytest.mark.asyncio
-async def test_process_doi_publisher_pattern_fallback(downloader, mock_http_client, temp_output_dir):
+async def test_process_doi_publisher_pattern_fallback(
+    downloader, mock_http_client, temp_output_dir
+):
     """When the OpenAlex OA URL is Cloudflare-blocked (HTML hull), the IEEE
     direct-PDF pattern must be attempted and can rescue the download."""
     doi = "10.1109/ICCV.2023.01234"
@@ -136,9 +147,7 @@ async def test_process_doi_publisher_pattern_fallback(downloader, mock_http_clie
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
-        "best_oa_location": {
-            "pdf_url": "https://ieeexplore.ieee.org/document/10209481"
-        }
+        "best_oa_location": {"pdf_url": "https://ieeexplore.ieee.org/document/10209481"}
     }
     mock_http_client.get = AsyncMock(return_value=mock_response)
 
@@ -177,7 +186,9 @@ async def test_process_doi_publisher_pattern_fallback(downloader, mock_http_clie
 
 
 @pytest.mark.asyncio
-async def test_process_doi_proxy_subdomain_attempt(downloader, mock_http_client, temp_output_dir):
+async def test_process_doi_proxy_subdomain_attempt(
+    downloader, mock_http_client, temp_output_dir
+):
     """Cloudflare-blocks both the OA URL and the direct PDF; the SNL-style
     subdomain-proxy rewrite rescues the download."""
     doi = "10.1109/ICCV.2023.01234"
@@ -211,7 +222,9 @@ async def test_process_doi_proxy_subdomain_attempt(downloader, mock_http_client,
         r.content.iter_chunked = mk_chunked
         return r
 
-    html = await make_response(b"<html><body>Checking your browser...</body></html>", "text/html")
+    html = await make_response(
+        b"<html><body>Checking your browser...</body></html>", "text/html"
+    )
     pdf = await make_response(b"%PDF-1.6\n", "application/pdf")
 
     mock_session.get.side_effect = [html, html, pdf]
@@ -222,3 +235,68 @@ async def test_process_doi_proxy_subdomain_attempt(downloader, mock_http_client,
     assert result.was_oa is True
     urls = [c[0][0] for c in mock_session.get.call_args_list]
     assert any("ieeexplore-ieee-org.www.sndl1.arn.dz" in u for u in urls), urls
+
+
+@pytest.mark.asyncio
+async def test_download_pdf_preserves_existing_destination_on_failure(
+    downloader, temp_output_dir
+):
+    destination = temp_output_dir / "existing.pdf"
+    destination.write_bytes(b"original")
+
+    mock_get = AsyncMock()
+    mock_get.raise_for_status = MagicMock(side_effect=RuntimeError("provider failure"))
+    mock_get.__aenter__.return_value = mock_get
+    mock_session = AsyncMock(spec=aiohttp.ClientSession)
+    mock_session.get.return_value = mock_get
+
+    with pytest.raises(RuntimeError, match="provider failure"):
+        await downloader.download_pdf(
+            mock_session, "https://example.test/paper.pdf", destination
+        )
+
+    assert destination.read_bytes() == b"original"
+    assert not list(temp_output_dir.glob(".pdf-acquisition-*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_process_doi_deduplicates_content_without_overwrite(
+    downloader, mock_http_client, temp_output_dir
+):
+    doi = "10.1234/deduplicate"
+    metadata = MagicMock()
+    metadata.status_code = 200
+    metadata.json.return_value = {
+        "best_oa_location": {"pdf_url": "https://example.test/paper.pdf"},
+    }
+    mock_http_client.get = AsyncMock(return_value=metadata)
+
+    response = AsyncMock()
+    response.raise_for_status = MagicMock()
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.headers = {"Content-Type": "application/pdf"}
+
+    async def chunks(*args, **kwargs):
+        yield pdf_bytes()
+
+    response.content.iter_chunked = chunks
+    session = AsyncMock(spec=aiohttp.ClientSession)
+    session.get.return_value = response
+
+    first = await downloader.process_doi(session, mock_http_client, doi)
+    first_bytes = first.file_path.read_bytes() if first.file_path else None
+    second = await downloader.process_doi(session, mock_http_client, doi)
+    assert first.success and second.success
+    assert first.file_path == second.file_path
+    assert first_bytes == second.file_path.read_bytes()
+    assert len(list(temp_output_dir.glob("DOC-*.pdf"))) == 1
+    assert not list(temp_output_dir.glob(".pdf-acquisition-*.tmp"))
+
+
+def test_gateway_and_forward_proxy_are_not_conflated(temp_output_dir):
+    with pytest.raises(ValueError, match="distinct"):
+        AsyncPDFDownloader(
+            output_dir=temp_output_dir,
+            institutional_gateway_url="https://gateway.test",
+            forward_proxy_url="https://gateway.test",
+        )
