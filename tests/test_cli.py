@@ -1,6 +1,6 @@
 import json
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
 from typer.testing import CliRunner
 
 from scholar_pdf.cli import app
@@ -15,7 +15,9 @@ def test_cli_download_single_doi(mock_process_doi, tmp_path):
         doi="10.1234/test", success=True, file_path=tmp_path / "test.pdf", was_oa=True
     )
 
-    result = runner.invoke(app, ["download", "--doi", "10.1234/test", "--output", str(tmp_path)])
+    result = runner.invoke(
+        app, ["download", "--doi", "10.1234/test", "--output", str(tmp_path)]
+    )
 
     assert result.exit_code == 0
     assert "Starting download process for 1 DOIs" in result.stdout
@@ -46,12 +48,14 @@ def test_cli_download_from_file(mock_process_doi, tmp_path):
         ),
     ]
 
-    result = runner.invoke(app, ["download", "--input", str(input_file), "--output", str(tmp_path)])
+    result = runner.invoke(
+        app, ["download", "--input", str(input_file), "--output", str(tmp_path)]
+    )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "Starting download process for 2 DOIs" in result.stdout
     assert "Success" in result.stdout
-    assert "Paywalled" in result.stdout
+    assert "Unresolved" in result.stdout
 
 
 def test_cli_no_input():
@@ -89,7 +93,15 @@ def test_cli_download_with_proxy_flags(mock_process_doi, tmp_path):
 def test_cli_download_rejects_unknown_proxy_style(tmp_path):
     result = runner.invoke(
         app,
-        ["download", "--doi", "10.1234/test", "--output", str(tmp_path), "--proxy-style", "bogus"],
+        [
+            "download",
+            "--doi",
+            "10.1234/test",
+            "--output",
+            str(tmp_path),
+            "--proxy-style",
+            "bogus",
+        ],
     )
     assert result.exit_code == 2
     assert isinstance(result.exception, SystemExit)

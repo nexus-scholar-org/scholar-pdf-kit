@@ -75,7 +75,7 @@ def validate_pdf_structure(file_path: Path) -> bool:
     except pypdf.errors.PdfReadError as exc:
         # "File has not been decrypted" means it is a real but encrypted PDF.
         return "decrypted" in str(exc).lower()
-    except Exception:
+    except Exception:  # noqa: BLE001 - any parser failure invalidates the candidate
         return False
 
 

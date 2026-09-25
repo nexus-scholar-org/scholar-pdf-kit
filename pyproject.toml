@@ -15,7 +15,6 @@ dependencies = [
     "requests>=2.31.0",
     "rich>=13.0.0",
     "tenacity>=8.0.0",
-    "scholar-search-kit",
     "pypdf>=4.0.0",
     "pymupdf>=1.24.0"
 ]
@@ -31,6 +30,7 @@ extract = [
     "requests",
     "lxml"
 ]
+search = ["scholar-search-kit"]
 
 [project.scripts]
 scholar-pdf = "scholar_pdf.cli:app"
