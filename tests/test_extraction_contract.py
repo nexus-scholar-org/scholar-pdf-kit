@@ -2535,6 +2535,17 @@ def test_e2_neg_024c_unvalidated_escaping_or_non_regular_destination_fails_close
     canonical root, plus a destination that already exists as a non-regular file.
     Every limb must report ``OperationStatus.FAILED`` with a ``None`` candidate and
     leave no write outside the root, on any platform, without a symlink.
+
+    This limb is also the *portable* no-publication proof for E2-NEG-024, and it
+    is the only one: the symlinked variants are ``pytest.skip``ped wherever
+    creating a symlink needs a privilege (Windows), so on those platforms the
+    escaping-prefix loop below is what actually pins the semantic -- a containment
+    violation is a request-level refusal, refused in preflight (section 7.3(1)),
+    so it mints no ``EXT-`` sidecar, no ``manifest_reference``, no artifact
+    checksum, and never enters the idempotency key space.  The last limb is
+    deliberately *not* a refusal: a destination that already exists as a
+    non-regular file is a determined failure of a valid request, so it keeps its
+    fail-closed sidecar and is asserted separately below.
     """
 
     escaping_prefixes = (
@@ -2558,6 +2569,13 @@ def test_e2_neg_024c_unvalidated_escaping_or_non_regular_destination_fails_close
         )
         assert outcome.status is OperationStatus.FAILED, storage_prefix
         assert outcome.data.candidate is None, storage_prefix
+        # A containment violation is refused, not determined: no sidecar is
+        # minted, so there is no manifest reference to hand back.  The symlinked
+        # limbs are skipped without the privilege to create a symlink, so this
+        # assertion is the regression-proof on every platform.
+        assert outcome.data.manifest_reference is None, storage_prefix
+        assert not fixture.sidecars(), storage_prefix
+        assert outcome.data.committed_count == 0, storage_prefix
         item = outcome.data.item_outcomes[0]
         assert item.extraction_status is ExtractionStatus.FAILED, storage_prefix
         assert item.extracted_path is None, storage_prefix
@@ -2567,6 +2585,9 @@ def test_e2_neg_024c_unvalidated_escaping_or_non_regular_destination_fails_close
             "SIDECAR_DIRECTORY_INVALID",
             "WORKSPACE_ROOT_UNAVAILABLE",
         }, item.error.code
+        # Refused in preflight, so the request is invalid before any extraction
+        # attempt: no engine ever saw the verified bytes.
+        assert engine.calls == [], storage_prefix
         assert not list((fixture.root / "extracted").rglob("*.md")), storage_prefix
 
     # A pre-existing non-regular destination cannot be replaced or written through.
@@ -2583,6 +2604,14 @@ def test_e2_neg_024c_unvalidated_escaping_or_non_regular_destination_fails_close
     )
     assert outcome.status is OperationStatus.FAILED
     assert outcome.data.candidate is None
+    # The counter-shape of the refusal above, and the reason the refusal guard is
+    # not "any failure": this request is valid, the engine ran, and the write was
+    # refused at the commit anchor.  That is a *determined* failure, so it keeps
+    # its fail-closed zero-byte sidecar exactly as an all-engine-failure batch
+    # does (E2-NEG-018c/E2-NEG-018e).  Only a batch whose every outcome is a
+    # request-level refusal publishes nothing.
+    assert outcome.data.manifest_reference is not None
+    assert len(fixture.sidecars()) == 1
     item = outcome.data.item_outcomes[0]
     assert item.extraction_status is ExtractionStatus.FAILED
     assert item.error is not None

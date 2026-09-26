@@ -244,6 +244,25 @@ class ExtractionCommitError(Exception):
         )
 
 
+#: Request-level refusal codes: the request is invalid *before* any extraction
+#: attempt, so the batch is refused rather than determined.
+#:
+#: Section 7.3(1) makes path containment a preflight verification and states that
+#: "no extraction and no output are produced before this succeeds".  A
+#: containment violation is therefore a refusal of the request, not a determined
+#: extraction failure, and it must never mint an ``EXT-`` sidecar, occupy the
+#: idempotency key space, or be replayed.
+#:
+#: The other request-level refusal codes this service defines (the parent,
+#: lineage, acquisition-manifest, workspace-binding, and replay-rejection codes
+#: raised as :class:`ExtractionPreflightError`) are already refused in preflight
+#: by :meth:`PDFExtractionService._preflight_failure` with no sidecar, so they
+#: cannot reach the commit path and are deliberately absent here.  Nothing is
+#: added: a code belongs in this set only if the codebase already raises it as a
+#: containment refusal.
+REFUSAL_ERROR_CODES: frozenset[str] = frozenset({"PATH_OUTSIDE_WORKSPACE"})
+
+
 @dataclass(frozen=True)
 class _PreparedExtraction:
     """One snapshot-verified request plus the E1 context it may extract."""
@@ -678,6 +697,7 @@ class PDFExtractionService:
             request, workspace_root
         )
         documents = self._select_documents(request, manifest)
+        self._anchor_storage_prefix(request, workspace_root)
         acquisition_ref = self._acquisition_reference(manifest)
         return _PreparedExtraction(
             request=request,
@@ -701,6 +721,36 @@ class PDFExtractionService:
                 ],
             ),
         )
+
+    def _anchor_storage_prefix(
+        self, request: ExtractionRequest, workspace_root: Path
+    ) -> None:
+        """Verify the output prefix can be anchored, before any engine runs.
+
+        Section 7.3(1) lists path containment among the preflight verifications
+        and states that "no extraction and no output are produced before this
+        succeeds".  Anchoring the prefix here is therefore a *preflight* refusal,
+        not a commit-time failure: the request is invalid on its face, so no
+        engine reads verified bytes and no output is attempted.
+
+        The check is the E1 anchor rule, reached through the shared
+        :meth:`_safe_workspace_path` primitive rather than a second copy of it,
+        and it runs with ``create=False`` so a valid prefix is not created as a
+        side effect of being validated.  :meth:`extract` already maps a
+        containment ``ExtractionCommitError`` raised here onto
+        :meth:`_preflight_failure`, which reports ``FAILED`` with
+        ``manifest_reference=None``, no sidecar, and no audit event -- so the
+        refusal never occupies the idempotency key space and is never replayed.
+        """
+
+        try:
+            self._safe_workspace_path(
+                workspace_root, request.storage_prefix, create=False
+            )
+        except ExtractionCommitError as error:
+            raise ExtractionPreflightError(
+                error.code, error.message, **error.details
+            ) from error
 
     def _verify_screening_parent(
         self, request: ExtractionRequest, workspace_root: Path
@@ -1408,6 +1458,16 @@ class PDFExtractionService:
             # sidecar's item_outcomes, referenced by the prior EXT- id, so the
             # recovery is auditable instead of a silent overwrite.
             outcomes = self._carry_superseded_outcomes(outcomes, prior_outcomes)
+        if self._is_refused_batch(outcomes):
+            # Section 7.3(1): the request was refused before any extraction
+            # attempt, so the batch is refused rather than determined.  Returning
+            # here mints no ``EXT-`` id, writes no sidecar, and appends no audit
+            # event, so the refusal cannot occupy the idempotency key space or be
+            # replayed by a later run (section 7.4).  This is deliberately *not*
+            # the all-engine-failure shape: a determined failure still publishes
+            # its fail-closed zero-byte sidecar, because "we ran and nothing was
+            # usable" and "we refused to run" are different facts.
+            return self._refused_batch_outcome(first, outcomes)
         status = self._operation_status(outcomes)
         manifest = self._build_manifest(prepared, records, outcomes, status)
         if prior_replay is not None:
@@ -1477,6 +1537,75 @@ class PDFExtractionService:
                 )
             )
         return carried
+
+    @staticmethod
+    def _is_refused_batch(outcomes: Sequence[ExtractionItemOutcome]) -> bool:
+        """Report whether every requested document was refused, not determined.
+
+        A refusal-class outcome is a request-level rejection: the containment
+        rule of section 7.3(1) refused the destination, so the batch carries no
+        determination about the documents and must publish nothing.  One refusal
+        is enough to make the batch invalid as a whole, so this is an ``all()``
+        over the *current* rows: a retained superseded row (6.7(9)) is sidecar
+        history, and a sibling that committed or merely failed keeps the batch a
+        determined one, which still commits (a mixed batch records its refused
+        sibling inside the committed sidecar, section 7.3(4)/(5)).
+        """
+
+        current = [outcome for outcome in outcomes if not outcome.is_superseded]
+        return bool(current) and all(
+            outcome.extraction_status is ExtractionStatus.FAILED
+            and outcome.error is not None
+            and outcome.error.code in REFUSAL_ERROR_CODES
+            for outcome in current
+        )
+
+    def _refused_batch_outcome(
+        self,
+        first: _PreparedExtraction,
+        outcomes: Sequence[ExtractionItemOutcome],
+    ) -> ExtractionBatchOutcome:
+        """Report a wholly refused batch with no sidecar, candidate, or audit.
+
+        The refusal keeps the per-document FAILED outcomes and the structured
+        error exactly as the commit path produced them -- the caller learns
+        *which* document was refused and *why* -- but the envelope carries no
+        ``manifest_reference``: nothing was published, so there is no
+        ``EXT-`` identity, no artifact checksum, and no idempotency key for a
+        later run to replay.
+        """
+
+        current = [outcome for outcome in outcomes if not outcome.is_superseded]
+        errors: list[StructuredError] = []
+        for outcome in current:
+            if outcome.error is not None and outcome.error not in errors:
+                errors.append(outcome.error)
+        if not errors:  # pragma: no cover - a refused row always carries its code
+            errors.append(
+                StructuredError(
+                    code="BATCH_FAILED",
+                    message="Every requested document was refused before extraction.",
+                )
+            )
+        return ExtractionBatchOutcome(
+            run_id=first.request.run_id,
+            status=OperationStatus.FAILED,
+            data=ExtractionOperationData(
+                manifest_reference=None,
+                item_outcomes=list(current),
+                committed_count=0,
+                requested_count=len(current),
+                candidate=None,
+            ),
+            errors=errors,
+            provenance={
+                "refused": True,
+                "refusal_codes": sorted(
+                    {outcome.error.code for outcome in current if outcome.error}
+                ),
+                "contract_acceptance": "not_performed_by_kit",
+            },
+        )
 
     def _extract_one(self, prepared: _PreparedExtraction) -> list[_StagedExtraction]:
         """Extract every selected document of one request, accounting for each."""
@@ -2969,6 +3098,7 @@ class PDFExtractionService:
 
 __all__ = [
     "EXTRACTION_AUDIT_ACTION",
+    "REFUSAL_ERROR_CODES",
     "ExtractionCommitError",
     "ExtractionFault",
     "ExtractionPreflightError",

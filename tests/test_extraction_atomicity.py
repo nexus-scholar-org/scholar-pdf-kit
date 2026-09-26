@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,24 @@ from scholar_pdf.extraction_models import ExtractionEngine, ExtractionManifest
 from scholar_pdf.frontmatter import parse_bound_frontmatter
 
 _TESTS_DIR = str(Path(__file__).resolve().parent)
+
+#: Terminal styling.  ``typer``/``rich`` colorize a help panel when stdout is a
+#: terminal, and the styling is applied per span rather than per word, so a
+#: hyphenated option name such as ``--audit-logger`` is not guaranteed to be
+#: contiguous in the raw bytes: on the Linux runners it arrives split mid-name
+#: across two ``1;36`` spans (bold cyan, which is typer's ``STYLE_OPTION``).
+#: Windows piped output is plain, so this is only visible on Linux.  The
+#: assertions below are about *content*, not about the absence of styling, so
+#: they strip the escape sequences instead of forcing ``NO_COLOR`` (which would
+#: change what the CLI is actually exercised as).  Stripping only SGR sequences
+#: cannot alter the text, so this stays a content assertion.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """Return ``text`` without ANSI SGR escape sequences."""
+
+    return _ANSI_SGR.sub("", text)
 
 
 def _registry() -> EngineRegistry:
@@ -367,4 +386,8 @@ def test_e2_pos_004_clean_isolated_wheel_import_and_help(tmp_path: Path) -> None
     ):
         result = run([str(entrypoint), *arguments], cwd=tmp_path, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert expected in result.stdout
+        # Asserted against the unstyled content so the check is identical on a
+        # Windows pipe and on a Linux terminal that splits the option name.
+        assert expected in strip_ansi(result.stdout), (
+            f"{arguments} did not document {expected!r}: {result.stdout}"
+        )
