@@ -94,6 +94,7 @@ from .extraction_models import (
     ENGINE_VERSION_UNKNOWN,
     EXTRACTION_MANIFEST_SCHEMA_VERSION,
     EXTRACTION_MANIFEST_TYPE,
+    PRE_COMMIT_STATUSES,
     SCREENING_DECISIONS_ARTIFACT_TYPE,
     SIDECAR_STORAGE_PREFIX,
     ArtifactRecordProjection,
@@ -103,7 +104,6 @@ from .extraction_models import (
     ExtractedDocumentRecord,
     ExtractionAttempt,
     ExtractionBatchOutcome,
-    ExtractionEngine,
     ExtractionItemOutcome,
     ExtractionManifest,
     ExtractionManifestReference,
@@ -117,6 +117,9 @@ from .extraction_models import (
     FallbackReason,
     FallbackStep,
     compute_extraction_idempotency_key,
+    determined_outcome_method,
+    extraction_method_for_engine,
+    project_content_status,
     utc_now,
 )
 from .frontmatter import (
@@ -126,8 +129,17 @@ from .frontmatter import (
     compose_extracted_file,
     is_legacy_stub,
     measure_extracted_body,
+    parse_bound_frontmatter,
+    sha256_bytes,
     verify_bound_frontmatter,
 )
+
+#: The one frontmatter key section 6.6 declares "provenance only; never in the
+#: identity payload".  Two runs of the same document therefore produce the same
+#: body and the same ``extracted_sha256`` but different file bytes, so this key
+#: is the only difference that may coalesce onto the file already committed
+#: (see ``ExtractionService._coalesce_existing_extraction``).
+PROVENANCE_ONLY_FRONTMATTER_KEYS = frozenset({"extracted_at"})
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -142,6 +154,8 @@ REASON_NO_TEXT_LAYER = "NO_EXTRACTABLE_TEXT_LAYER"
 REASON_CHAIN_EXHAUSTED = "ENGINE_CHAIN_EXHAUSTED"
 REASON_ENGINE_SUBSTITUTED = "ENGINE_SUBSTITUTED"
 REASON_PAGE_DEGRADED = "PAGE_WITHOUT_TEXT_LAYER"
+#: Section 6.1: a cancelled item is accounted for and is never authoritative.
+REASON_EXTRACTION_CANCELLED = "EXTRACTION_CANCELLED"
 
 #: Per-sidecar lock suffix, mirroring E1's per-manifest lock.
 SIDECAR_LOCK_SUFFIX = ".json.lock"
@@ -151,6 +165,13 @@ EXTRACTED_SUFFIXES = {
     ExtractionOutputFormat.MARKDOWN: ".md",
     ExtractionOutputFormat.TEI_XML: ".tei.xml",
 }
+
+#: Non-volatile extraction inputs that packet 7.4's idempotency key deliberately
+#: does not cover, because they are not part of the request-side document set:
+#: they change the work and its bytes, so a rerun that changes them under an
+#: existing key is a changed payload (``IDEMPOTENCY_CONFLICT``, E2-NEG-018) and
+#: never a silent reuse.  They are recorded per attempt in ``request_shape``.
+NON_KEYED_REQUEST_KEYS = ("grobid_url", "page_range")
 
 
 class ExtractionFault(StrEnum):
@@ -354,7 +375,7 @@ class PDFExtractionService:
         async with lock:
             with self._extraction_publication_lock(first.workspace_root):
                 try:
-                    replay = self._find_run_replay(
+                    replay, prior = self._find_run_replay(
                         first.workspace_root,
                         first.request.run_id,
                         first.idempotency_key,
@@ -362,8 +383,31 @@ class PDFExtractionService:
                 except ExtractionPreflightError as error:
                     return self._preflight_failure(snapshot, error)
                 if replay is not None:
-                    return await self._replay_outcome(replay, prepared)
-                return await self._extract_locked(prepared)
+                    try:
+                        return await self._replay_outcome(replay, prepared)
+                    except ExtractionPreflightError as error:
+                        return self._preflight_failure(snapshot, error)
+                    except ExtractionCommitError as error:
+                        # A published sidecar whose bound source bytes or
+                        # committed extracted bodies no longer verify is a
+                        # fail-closed replay rejection, not an exception that
+                        # escapes the public API (E2-NEG-017 / E2-NEG-040).  This
+                        # mirrors E1's REPLAY_VERIFICATION_FAILED precedent
+                        # (acquisition.py:600-607).
+                        return self._preflight_failure(
+                            snapshot,
+                            ExtractionPreflightError(
+                                "REPLAY_VERIFICATION_FAILED",
+                                (
+                                    "A matching extraction sidecar failed byte, "
+                                    "checksum, or lineage verification."
+                                ),
+                                manifest_id=replay[0].manifest_id,
+                                manifest_checksum=replay[0].artifact_checksum,
+                                failure_code=error.code,
+                            ),
+                        )
+                return await self._extract_locked(prepared, prior_outcomes=prior)
 
     def verify_manifest(
         self, manifest: ExtractionManifest, *, verify_bytes: bool
@@ -821,18 +865,37 @@ class PDFExtractionService:
 
     def _find_run_replay(
         self, workspace_root: Path, run_id: str, expected_key: str
-    ) -> tuple[ExtractionManifest, Path] | None:
+    ) -> tuple[
+        tuple[ExtractionManifest, Path] | None,
+        dict[str, tuple[str, ExtractionItemOutcome]],
+    ]:
         """Locate a published sidecar that already binds this exact request.
 
-        The lookup is by the recomputed *request-side* idempotency key, and the
-        resulting ``EXT-`` id is then re-verified from the published sidecar's own
-        records.  A key that matches while the id differs is the section 6.7(9)
-        successor, not a replay, and is handled as a fresh commit.
+        The replay lookup is keyed by the **recomputed deterministic ``EXT-`` id**,
+        not by the request-side idempotency key alone (packet E2 section 7.4).
+        The two identities are not redundant: ``idempotency_key`` covers the
+        request-side payload (workspace, run, acquisition reference, document set,
+        requested engine), while the ``EXT-`` id covers the normalized extraction
+        records and therefore their outcomes.
+
+        A prior commit that shares the key is a *replay* only when its recomputed
+        ``EXT-`` id is byte-bearing and self-consistent, which is exactly the case
+        where a rerun recomputes the same id.  A prior commit that left a document
+        in a determined non-byte-bearing state (``EXTRACTION_FAILED`` /
+        ``NO_TEXT_LAYER``) is instead the section 6.7(9) **successor** case: a
+        retry may now succeed, so it must mint a new ``EXT-`` id and must never be
+        reported as ``REUSED``.  Those superseded outcomes are returned so the
+        successor commit keeps them visible by reference.
+
+        A changed non-volatile payload under an existing key remains
+        ``IDEMPOTENCY_CONFLICT``, and more than one byte-bearing commit for the
+        same key is ambiguous and also fails closed.
         """
 
         manifest_root = workspace_root / SIDECAR_STORAGE_PREFIX / run_id
+        prior: dict[str, tuple[str, ExtractionItemOutcome]] = {}
         if not manifest_root.exists():
-            return None
+            return None, prior
         replay: tuple[ExtractionManifest, Path] | None = None
         try:
             canonical_root = manifest_root.resolve(strict=True)
@@ -861,15 +924,73 @@ class PDFExtractionService:
                 ) from error
             if manifest.run_id != run_id:
                 continue
-            if manifest.idempotency_key == expected_key:
-                if replay is not None:
-                    raise ExtractionPreflightError(
-                        "IDEMPOTENCY_CONFLICT",
-                        "The run contains more than one matching extraction sidecar.",
-                        manifest_id=manifest.manifest_id,
-                    )
-                replay = (manifest, path)
-        return replay
+            if manifest.idempotency_key != expected_key:
+                continue
+            # Recompute the deterministic EXT- id from the sidecar's own
+            # normalized records: this is the replay key.  A published sidecar
+            # that no longer recomputes its own id is not a replay candidate.
+            recomputed_id = deterministic_extraction_manifest_id(
+                schema_version=manifest.schema_version,
+                workspace_id=manifest.workspace_id,
+                run_id=manifest.run_id,
+                acquisition_manifest_ref=manifest.acquisition_manifest_ref.model_dump(
+                    mode="json"
+                ),
+                extraction_records=self._stable_extraction_records(
+                    manifest.item_outcomes, manifest.records
+                ),
+                algorithm_version=manifest.manifest_identity_algorithm_version,
+            )
+            if recomputed_id != manifest.manifest_id:  # pragma: no cover - defensive
+                raise ExtractionPreflightError(
+                    "SIDECAR_CORRUPT",
+                    "An extraction sidecar does not recompute its own EXT- id.",
+                    path=path.name,
+                )
+            superseded = self._superseded_outcomes(manifest)
+            if superseded:
+                # Section 6.7(9): a prior determined failure is not a replay, and
+                # a rerun that succeeds mints a new EXT- id under the same key.
+                prior.update(
+                    {
+                        document: (manifest.manifest_id, outcome)
+                        for document, outcome in superseded.items()
+                    }
+                )
+                continue
+            if replay is not None:
+                raise ExtractionPreflightError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "The run contains more than one matching extraction sidecar.",
+                    manifest_id=manifest.manifest_id,
+                )
+            replay = (manifest, path)
+        return replay, prior
+
+    @staticmethod
+    def _superseded_outcomes(
+        manifest: ExtractionManifest,
+    ) -> dict[str, ExtractionItemOutcome]:
+        """Return this sidecar's non-byte-bearing outcomes, keyed by document.
+
+        Only a document that owns no bytes can be superseded; a byte-bearing
+        commit is already final, so a later run that recomputes a different
+        ``EXT-`` id for it is a genuine divergence rather than a successor.
+
+        Rows that are *already* superseded are excluded: they are retained prior
+        history inside this sidecar, and treating them as a fresh pending failure
+        would make an exact rerun of a successor commit again instead of
+        reporting ``REUSED``.
+        """
+
+        byte_bearing = {record.document_id for record in manifest.records}
+        return {
+            outcome.document_id: outcome
+            for outcome in manifest.item_outcomes
+            if outcome.document_id is not None
+            and outcome.document_id not in byte_bearing
+            and not outcome.is_superseded
+        }
 
     async def _replay_outcome(
         self,
@@ -901,8 +1022,20 @@ class PDFExtractionService:
         # Fail closed when the published sidecar's bound bytes or extracted bodies
         # no longer verify (E2-NEG-017 / E2-NEG-040).
         self.verify_manifest(manifest, verify_bytes=True)
+        # A replay re-reports the published commit, never a fresh extraction.  The
+        # content status is re-projected with the row: `REUSED` projects onto
+        # `VALID`, so a degraded (PARTIAL) commit cannot keep its stale PARTIAL
+        # projection on a REUSED row.  The degradation itself stays visible on
+        # `degradation_reasons`, and the authoritative committed record -- which
+        # is what the candidate is built from -- keeps its original PARTIAL
+        # content status, so the artifact payload stays byte-identical.
         outcomes = [
-            item.model_copy(update={"extraction_status": ExtractionStatus.REUSED})
+            item.model_copy(
+                update={
+                    "extraction_status": ExtractionStatus.REUSED,
+                    "content_status": project_content_status(ExtractionStatus.REUSED),
+                }
+            )
             if item.extraction_status in BYTE_BEARING_STATUSES
             else item
             for item in manifest.item_outcomes
@@ -959,20 +1092,112 @@ class PDFExtractionService:
                         "source bytes.",
                         document_id=source.document_id,
                     )
+                self._verify_replay_request_shape(manifest, request, source)
+
+    def _verify_replay_request_shape(
+        self,
+        manifest: ExtractionManifest,
+        request: ExtractionRequest,
+        source: AcquiredDocumentRecord,
+    ) -> None:
+        """Refuse a replay whose non-keyed, non-volatile inputs changed.
+
+        Packet 7.4 fixes the idempotency key to the workspace, run, acquisition
+        reference, and the ``{document_id, source_sha256, requested_engine}``
+        document set.  The page range and the provider endpoint are extraction
+        inputs that change the work and its bytes but are deliberately *not* in
+        that key, so a rerun that changes them still lands on the same key.  Such
+        a rerun is a changed non-volatile payload under an existing key: it is an
+        ``IDEMPOTENCY_CONFLICT``, never a silent reuse of bytes that were
+        extracted under different settings (E2-NEG-018).
+        """
+
+        published = next(
+            (
+                outcome
+                for outcome in manifest.item_outcomes
+                if outcome.study_id == source.study_id
+                and outcome.document_id == source.document_id
+            ),
+            None,
+        )
+        if published is None:
+            return
+        current = self._request_shape(request)
+        for attempt in published.attempts:
+            if any(
+                attempt.request_shape.get(name) != current.get(name)
+                for name in NON_KEYED_REQUEST_KEYS
+            ):
+                raise ExtractionPreflightError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "A persisted extraction key no longer names the same page "
+                    "range or provider endpoint.",
+                    document_id=source.document_id,
+                )
 
     # ------------------------------------------------------------------
     # Extraction
     # ------------------------------------------------------------------
 
     async def _extract_locked(
-        self, prepared: Sequence[_PreparedExtraction]
+        self,
+        prepared: Sequence[_PreparedExtraction],
+        prior_outcomes: Mapping[str, tuple[str, ExtractionItemOutcome]] | None = None,
     ) -> ExtractionBatchOutcome:
         first = prepared[0]
         staged: list[_StagedExtraction] = []
-        for item in prepared:
-            staged.extend(self._extract_one(item))
+        for index, item in enumerate(prepared):
+            for position, source in enumerate(item.documents):
+                try:
+                    entries = self._extract_one_document(item, source)
+                except ExtractionCommitError as error:
+                    # A commit failure is an item-level, fail-closed outcome, not
+                    # an exception that escapes the public API (E1's per-item
+                    # `_failed_item` precedent).  Section 7.5: a valid existing
+                    # output is never removed by a failed refresh, so the
+                    # content-addressed bytes that are already published stay.
+                    entries = [
+                        _StagedExtraction(
+                            record=None,
+                            outcome=self._commit_failure_outcome(item, source, error),
+                        )
+                    ]
+                staged.extend(entries)
+                if not any(
+                    entry.outcome.extraction_status is ExtractionStatus.CANCELLED
+                    for entry in entries
+                ):
+                    continue
+                # Section 6.1/7.3: once the caller cancelled, the rest of the
+                # batch is accounted for as cancelled rather than silently
+                # dropped -- and none of it commits a record.
+                for later in prepared[index:]:
+                    for pending in later.documents:
+                        if pending is source:
+                            continue
+                        already = any(
+                            staged_entry.outcome.document_id == pending.document_id
+                            for staged_entry in staged
+                        )
+                        if not already:
+                            staged.append(
+                                _StagedExtraction(
+                                    record=None,
+                                    outcome=self._cancelled_outcome(later, pending),
+                                )
+                            )
+                break
+            else:
+                continue
+            break
         records = [entry.record for entry in staged if entry.record is not None]
         outcomes = [entry.outcome for entry in staged]
+        if prior_outcomes:
+            # Section 6.7(9): the superseded outcome stays visible in this
+            # sidecar's item_outcomes, referenced by the prior EXT- id, so the
+            # recovery is auditable instead of a silent overwrite.
+            outcomes = self._carry_superseded_outcomes(outcomes, prior_outcomes)
         status = self._operation_status(outcomes)
         manifest = self._build_manifest(prepared, records, outcomes, status)
         sidecar_relative = f"{SIDECAR_STORAGE_PREFIX}/{first.request.run_id}/{manifest.manifest_id}.json"
@@ -994,41 +1219,160 @@ class PDFExtractionService:
             extra_errors=[audit_error] if audit_error is not None else [],
         )
 
+    @staticmethod
+    def _carry_superseded_outcomes(
+        outcomes: list[ExtractionItemOutcome],
+        prior: Mapping[str, tuple[str, ExtractionItemOutcome]],
+    ) -> list[ExtractionItemOutcome]:
+        """Append the prior determined outcomes that this run superseded.
+
+        The superseded rows are appended verbatim except for the two fields that
+        make the supersession auditable: ``prior_outcome_manifest_id`` names the
+        ``EXT-`` id of the sidecar that previously held the outcome, and
+        ``prior_outcome_status`` names the status it held there.  They are
+        non-byte-bearing rows for a document that now owns a byte-bearing record,
+        which is the only successor shape section 6.7(9) allows.
+        """
+
+        carried = list(outcomes)
+        current = {
+            outcome.document_id
+            for outcome in carried
+            if outcome.extraction_status in BYTE_BEARING_STATUSES
+        }
+        for document_id, (prior_manifest_id, prior_outcome) in sorted(prior.items()):
+            if document_id not in current or prior_outcome.extraction_status in (
+                BYTE_BEARING_STATUSES
+            ):
+                continue
+            carried.append(
+                prior_outcome.model_copy(
+                    update={
+                        "prior_outcome_manifest_id": prior_manifest_id,
+                        "prior_outcome_status": prior_outcome.extraction_status,
+                    }
+                )
+            )
+        return carried
+
     def _extract_one(self, prepared: _PreparedExtraction) -> list[_StagedExtraction]:
         """Extract every selected document of one request, accounting for each."""
 
         results: list[_StagedExtraction] = []
         for source in prepared.documents:
+            results.extend(self._extract_one_document(prepared, source))
+        return results
+
+    def _extract_one_document(
+        self, prepared: _PreparedExtraction, source: AcquiredDocumentRecord
+    ) -> list[_StagedExtraction]:
+        """Extract one document, or convert a cancellation into a truthful row.
+
+        ``asyncio.CancelledError`` inherits from ``BaseException``, so it is not
+        swallowed by the engine-failure handling above: a cancelled document
+        returns a ``CANCELLED`` outcome with no record and no candidate entry
+        (section 6.1 -- a cancelled item is never authoritative), and the caller
+        marks the remaining documents of the batch cancelled as well.  This
+        mirrors E1's acquisition cancellation semantics
+        (``acquisition.py:1589-1597``).
+        """
+
+        try:
             self._inject(ExtractionFault.ENGINE, source.document_id)
             data = self._read_verified_source(prepared, source)
             chain = self._run_chain(prepared, source, data)
-            evaluation = self._evaluate(prepared, chain)
-            if evaluation.status not in BYTE_BEARING_STATUSES:
-                results.append(
-                    _StagedExtraction(
-                        record=None,
-                        outcome=self._determined_outcome(
-                            prepared, source, chain, evaluation
-                        ),
-                    )
-                )
-                continue
-            committed, promoted_new = self._commit_bytes(
-                prepared, source, chain, evaluation
-            )
-            record = self._extracted_record(
-                prepared, source, chain, evaluation, committed
-            )
-            results.append(
+        except asyncio.CancelledError:
+            return [
                 _StagedExtraction(
-                    record=record,
-                    outcome=self._committed_outcome(
-                        prepared, source, chain, evaluation, committed
-                    ),
-                    promoted_new=promoted_new,
+                    record=None, outcome=self._cancelled_outcome(prepared, source)
                 )
+            ]
+        evaluation = self._evaluate(prepared, chain)
+        if evaluation.status not in BYTE_BEARING_STATUSES:
+            return [
+                _StagedExtraction(
+                    record=None,
+                    outcome=self._determined_outcome(
+                        prepared, source, chain, evaluation
+                    ),
+                )
+            ]
+        committed, promoted_new = self._commit_bytes(
+            prepared, source, chain, evaluation
+        )
+        record = self._extracted_record(prepared, source, chain, evaluation, committed)
+        return [
+            _StagedExtraction(
+                record=record,
+                outcome=self._committed_outcome(
+                    prepared, source, chain, evaluation, committed
+                ),
+                promoted_new=promoted_new,
             )
-        return results
+        ]
+
+    def _commit_failure_outcome(
+        self,
+        prepared: _PreparedExtraction,
+        source: AcquiredDocumentRecord,
+        error: ExtractionCommitError,
+    ) -> ExtractionItemOutcome:
+        """Account for a document whose commit failed before any record existed.
+
+        The identity-addressed path is the storage contract (7.5), so a second
+        extraction of the same document that produces different bytes cannot
+        occupy it.  The batch reports that as an explicit, per-item failure with
+        the code the commit path raised; it never overwrites the published body
+        and never invents a record.
+        """
+
+        return ExtractionItemOutcome(
+            study_id=source.study_id,
+            document_id=source.document_id,
+            extraction_status=ExtractionStatus.FAILED,
+            requested_engine=prepared.request.requested_engine.upper(),
+            content_status=DocumentContentStatus.FAILED,
+            # The failure is decided by a deterministic rule over the storage
+            # contract, not by the engine that produced the candidate bytes, so
+            # the method records exactly that.
+            extraction_method=ExtractionMethod.DETERMINISTIC_RULE,
+            source_sha256=source.source_sha256,
+            acquisition_manifest_id=prepared.request.acquisition_manifest_id,
+            acquisition_manifest_sha256=prepared.request.acquisition_manifest_sha256,
+            stage=ExtractionStage.PROMOTION,
+            error=StructuredError(
+                code=error.code,
+                message=error.message,
+                retryable=False,
+                details={"document_id": source.document_id},
+            ),
+        )
+
+    def _cancelled_outcome(
+        self, prepared: _PreparedExtraction, source: AcquiredDocumentRecord
+    ) -> ExtractionItemOutcome:
+        """Account for a document the caller cancelled before any commit."""
+
+        return ExtractionItemOutcome(
+            study_id=source.study_id,
+            document_id=source.document_id,
+            extraction_status=ExtractionStatus.CANCELLED,
+            requested_engine=prepared.request.requested_engine.upper(),
+            content_status=None,
+            # A cancelled item emits no record, so the frozen method never
+            # applies; the outcome keeps the source identity it would have had.
+            extraction_method=None,
+            source_sha256=source.source_sha256,
+            acquisition_manifest_id=prepared.request.acquisition_manifest_id,
+            acquisition_manifest_sha256=prepared.request.acquisition_manifest_sha256,
+            stage=ExtractionStage.ENGINE,
+            error=StructuredError(
+                code=REASON_EXTRACTION_CANCELLED,
+                message="Extraction was cancelled before content commit.",
+                retryable=True,
+                details={"document_id": source.document_id},
+            ),
+        )
 
     def _read_verified_source(
         self, prepared: _PreparedExtraction, record: AcquiredDocumentRecord
@@ -1389,6 +1733,11 @@ class PDFExtractionService:
         # entry in place of the file, and the promotion below would then collide
         # with it instead of publishing the validated bytes.
         final = self._prepared_file_path(prepared.workspace_root, relative)
+        coalesced = self._coalesce_existing_extraction(
+            prepared, relative=relative, committed=committed
+        )
+        if coalesced is not None:
+            return coalesced, False
         self._write_commit_intent(
             final,
             {
@@ -1430,6 +1779,74 @@ class PDFExtractionService:
                 promotion.temporary_leftover.name,
             )
         return committed, promotion.promoted_new
+
+    def _coalesce_existing_extraction(
+        self,
+        prepared: _PreparedExtraction,
+        *,
+        relative: str,
+        committed: CommittedFile,
+    ) -> CommittedFile | None:
+        """Adopt the file already committed when only provenance differs.
+
+        Packet E2 section 6.6 keeps ``extracted_at`` in the bound frontmatter and
+        labels it "provenance only; never in the identity payload", so two runs
+        over the same document with the same requested engine produce the same
+        body -- and therefore the same ``extracted_sha256`` -- while their file
+        bytes differ only by the clock.  Section 7.5 requires concurrent
+        duplicate logical inputs to "deterministically coalesce to exactly one
+        committed extraction" and forbids removing a valid existing output, so
+        such a re-extraction must adopt the bytes on disk instead of colliding
+        with them.  Returning ``None`` leaves the ordinary paths in charge: an
+        identical file is still promoted as ``promoted_new=False`` and a genuine
+        content difference is still a ``CONTENT_COLLISION`` (``E2-NEG-017``).
+
+        The comparison is deliberately exact.  Every frontmatter key is compared
+        and the only tolerated difference is a provenance-only one, so a
+        different engine, a different status, or a different body never
+        coalesces; a symlinked or unparsable destination is never adopted.  The
+        returned :class:`CommittedFile` describes the bytes actually on disk, so
+        the record's ``extracted_file_sha256`` stays truthful, and the body
+        digest is recomputed from the file rather than trusted from its
+        frontmatter.
+        """
+
+        final = self._prepared_file_path(prepared.workspace_root, relative)
+        if final.is_symlink() or not final.is_file():
+            return None
+        try:
+            data = final.read_bytes()
+        except OSError:
+            return None
+        if data == committed.data:
+            return None
+        try:
+            existing_values, existing_body = parse_bound_frontmatter(data)
+            fresh_values, _ = parse_bound_frontmatter(committed.data)
+        except FrontmatterError:
+            return None
+        differing = {
+            key
+            for key in set(existing_values) | set(fresh_values)
+            if str(existing_values.get(key)) != str(fresh_values.get(key))
+        }
+        if not differing or not differing <= PROVENANCE_ONLY_FRONTMATTER_KEYS:
+            return None
+        body_sha256 = sha256_bytes(existing_body.encode("utf-8"))
+        if body_sha256 != str(existing_values.get("extracted_sha256")):
+            return None
+        if body_sha256 != committed.extracted_sha256:
+            return None
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:  # pragma: no cover - parse_bound_frontmatter raised
+            return None
+        return CommittedFile(
+            text=text,
+            data=data,
+            extracted_sha256=body_sha256,
+            file_sha256=sha256_bytes(data),
+        )
 
     def _compose(
         self,
@@ -1540,11 +1957,7 @@ class PDFExtractionService:
     def _method_for(engine: str) -> ExtractionMethod:
         """Map an engine to the frozen extraction method it yields."""
 
-        return {
-            ExtractionEngine.PYMUPDF.value: ExtractionMethod.DETERMINISTIC_RULE,
-            ExtractionEngine.DOCLING.value: ExtractionMethod.HEURISTIC,
-            ExtractionEngine.GROBID.value: ExtractionMethod.EXTERNAL_PROVIDER,
-        }.get(engine, ExtractionMethod.HEURISTIC)
+        return extraction_method_for_engine(engine)
 
     def _committed_outcome(
         self,
@@ -1598,7 +2011,12 @@ class PDFExtractionService:
             effective_engine=evaluation.effective_engine,
             effective_engine_version=evaluation.effective_version,
             content_status=evaluation.content_status,
-            extraction_method=None,
+            # The frozen DocumentRecord requires extraction_method on every
+            # record, so a determined outcome states how it was reached instead
+            # of leaving the field null.  The value is derived from the attempts
+            # that actually ran: a provider engine gives EXTERNAL_PROVIDER, a
+            # structural no-engine failure gives DETERMINISTIC_RULE.
+            extraction_method=determined_outcome_method(chain.attempts),
             page_count=evaluation.page_count,
             character_count=evaluation.character_count,
             source_sha256=source.source_sha256,
@@ -1783,13 +2201,27 @@ class PDFExtractionService:
 
     @staticmethod
     def _operation_status(outcomes: Sequence[ExtractionItemOutcome]) -> OperationStatus:
+        """Map the batch onto the canonical ``OperationStatus`` vocabulary.
+
+        A retained superseded row (section 6.7(9)) is sidecar history, not a
+        requested document, so it is excluded from the counts: a single-document
+        retry that now succeeds is a full ``SUCCESS`` of the one current item, and
+        reporting ``PARTIAL`` for it would misreport the batch.
+        """
+
+        current = [outcome for outcome in outcomes if not outcome.is_superseded]
         committed = sum(
-            outcome.extraction_status in BYTE_BEARING_STATUSES for outcome in outcomes
+            outcome.extraction_status in BYTE_BEARING_STATUSES for outcome in current
         )
-        if committed == len(outcomes):
+        if committed == len(current):
             return OperationStatus.SUCCESS
         if committed:
             return OperationStatus.PARTIAL
+        if any(
+            outcome.extraction_status is ExtractionStatus.CANCELLED
+            for outcome in current
+        ):
+            return OperationStatus.CANCELLED
         return OperationStatus.FAILED
 
     def _build_candidate(
@@ -1809,12 +2241,22 @@ class PDFExtractionService:
         committed_records: list[ExtractedDocumentRecord] = []
         non_committed: list[ArtifactRecordProjection] = []
         for outcome in outcomes:
+            if outcome.is_superseded:
+                # A retained prior outcome is sidecar history, not a second
+                # candidate document: the document's candidate record is the one
+                # its current outcome produced.
+                continue
             record = by_document.get(outcome.document_id or "")
             if (
                 record is not None
                 and outcome.extraction_status in BYTE_BEARING_STATUSES
             ):
                 committed_records.append(record)
+            elif outcome.extraction_status in PRE_COMMIT_STATUSES:
+                # Section 6.1: CANCELLED / pre-commit FAILED emit no record at
+                # all -- not a FAILED DocumentRecord.  The failure taxonomy that
+                # does reach the candidate is DETERMINED_FAILURE_STATUSES only.
+                continue
             elif outcome.document_id is not None and outcome.source_sha256:
                 non_committed.append(ArtifactRecordProjection.from_outcome(outcome))
         # A run in which *no* document produced a byte-bearing record constructs
@@ -1846,8 +2288,14 @@ class PDFExtractionService:
         candidate: DocumentManifestCandidate | None,
         extra_errors: Sequence[StructuredError] = (),
     ) -> ExtractionBatchOutcome:
+        # The envelope reports the batch's *current* truth.  A superseded row
+        # (section 6.7(9)) is retained in the sidecar's ``item_outcomes`` for
+        # auditability, but handing it back to a caller as if it were the
+        # document's current state -- and counting it as a requested document --
+        # would make a recovered single-document batch look like a partial one.
+        current = [outcome for outcome in outcomes if not outcome.is_superseded]
         committed = sum(
-            outcome.extraction_status in BYTE_BEARING_STATUSES for outcome in outcomes
+            outcome.extraction_status in BYTE_BEARING_STATUSES for outcome in current
         )
         root = self.workspace_bindings[manifest.workspace_id].canonical_root
         # A FAILED/CANCELLED envelope must not be silent: carry the batch-level
@@ -1858,7 +2306,7 @@ class PDFExtractionService:
             for error in manifest.operation.errors:
                 if error not in errors:
                     errors.append(error)
-            for outcome in outcomes:
+            for outcome in current:
                 if outcome.error is not None and outcome.error not in errors:
                     errors.append(outcome.error)
             if not errors:
@@ -1877,9 +2325,9 @@ class PDFExtractionService:
                     workspace_relative_path=self._relative_path(root, manifest_path),
                     artifact_checksum=manifest.artifact_checksum,
                 ),
-                item_outcomes=list(outcomes),
+                item_outcomes=current,
                 committed_count=committed,
-                requested_count=len(outcomes),
+                requested_count=len(current),
                 candidate=candidate,
             ),
             errors=errors,
@@ -1909,7 +2357,11 @@ class PDFExtractionService:
                 requested_engine=request.requested_engine.upper(),
                 requested_engine_version=None,
                 content_status=DocumentContentStatus.FAILED,
-                extraction_method=None,
+                # No engine ran: a preflight rejection is determined entirely by
+                # a deterministic rule over the request and its lineage, so the
+                # method records exactly that instead of asserting a model or
+                # provider involvement that never happened.
+                extraction_method=ExtractionMethod.DETERMINISTIC_RULE,
                 source_sha256=None,
                 acquisition_manifest_id=request.acquisition_manifest_id,
                 acquisition_manifest_sha256=request.acquisition_manifest_sha256,

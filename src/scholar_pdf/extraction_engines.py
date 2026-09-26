@@ -538,7 +538,10 @@ def engine_chain(
     requested = registry.get(requested_engine)
     chain: list[ExtractionEngineAdapter] = [requested]
     if not allow_fallback:
-        return [requested.value], chain
+        # The chain carries *engine tokens*, not adapters: the requested adapter
+        # has no ``.value``, so the single-engine chain must read its name (the
+        # same shape the fallback branch below returns).
+        return [requested.name.value], chain
     for token in fallback_order:
         if token == requested_engine:
             continue

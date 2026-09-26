@@ -88,6 +88,11 @@ downloads/
 output/
 chroma_db/
 *.pdf
+# WP01-E2 needs exactly one *real* text-layer PDF committed as an offline
+# fixture: a synthetic stub cannot exercise the minimum-usable-text rule
+# (E2-NEG-013/E2-NEG-015) without pretending a stub is content.  Every other
+# PDF is a downloaded or generated workspace artifact and stays ignored.
+!tests/fixtures/*.pdf
 *.json
 *.bib
 *.html

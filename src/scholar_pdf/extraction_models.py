@@ -47,7 +47,7 @@ attempt vocabularies that E2 must preserve rather than rewrite.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -273,6 +273,62 @@ def project_content_status(status: ExtractionStatus) -> DocumentContentStatus:
         ) from error
 
 
+def extraction_method_for_engine(engine: str | None) -> ExtractionMethod:
+    """Map an engine name onto the frozen method its output yields.
+
+    An unknown or absent engine yields ``HEURISTIC`` so a committed record can
+    never claim a stronger provenance than the evidence supports.
+    """
+
+    try:
+        return ENGINE_METHODS[ExtractionEngine(engine)]
+    except (KeyError, ValueError):
+        return ExtractionMethod.HEURISTIC
+
+
+def determined_outcome_method(
+    attempts: Sequence[ExtractionAttempt],
+) -> ExtractionMethod:
+    """Derive the truthful ``extraction_method`` for a document that owns no bytes.
+
+    A ``FAILED``/``NEEDS_OCR`` ``DocumentRecord`` still carries a mandatory
+    ``extraction_method`` in the frozen model (only ``extracted_path`` is
+    conditional), so the value has to describe how the outcome was reached:
+
+    1. If any recorded attempt ran a provider/daemon engine, the outcome was
+       produced through an external service, so ``EXTERNAL_PROVIDER`` is the
+       honest value.  This takes precedence because a provider attempt changes
+       the provenance of the determination even when a later local engine also
+       ran and failed.
+    2. Otherwise, if at least one engine attempt is recorded, the method of the
+       *last* attempt is the provenance of the determination -- that attempt is
+       the one that produced the final unusable result.
+    3. Otherwise no engine ever ran (a structural rejection, or a failure raised
+       before the chain started).  The determination was then made entirely by a
+       deterministic rule over the request and lineage, so
+       ``DETERMINISTIC_RULE`` is recorded.  Claiming ``EXTERNAL_PROVIDER`` or
+       ``HEURISTIC`` here would assert a model or provider involvement that did
+       not happen -- exactly the fabrication this field exists to prevent.
+
+    The result is never ``None``: the frozen model requires the field on every
+    record, and a null there is a rejection, not a permitted absence.
+    """
+
+    methods = [
+        ENGINE_METHODS.get(ExtractionEngine(attempt.engine), None)
+        for attempt in attempts
+    ]
+    provider_methods = [
+        method for method in methods if method is ExtractionMethod.EXTERNAL_PROVIDER
+    ]
+    if provider_methods:
+        return ExtractionMethod.EXTERNAL_PROVIDER
+    determined = [method for method in methods if method is not None]
+    if determined:
+        return determined[-1]
+    return ExtractionMethod.DETERMINISTIC_RULE
+
+
 def compute_extraction_idempotency_key(
     *,
     workspace_id: str,
@@ -382,7 +438,12 @@ class ExtractionRequest(ExtractionModel):
     grobid_url: str | None = None
     page_range: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    verify_source_bytes: bool = True
+    # There is deliberately no request-level byte-verification switch.  Packet E2
+    # section 6.7 rule 2 makes source-byte verification mandatory for every
+    # commit, so a per-request opt-out would be a silent no-op override of a
+    # mandatory check.  The service constructor's `verify_source_bytes` flag is
+    # the single authority, and the base model forbids extra fields, so a config
+    # that still carries this key is rejected explicitly instead of ignored.
     allow_fallback: bool = True
     storage_prefix: str = DEFAULT_STORAGE_PREFIX
     usability_profile: UsabilityProfile = Field(
@@ -785,6 +846,17 @@ class ExtractionItemOutcome(ExtractionModel):
     error: StructuredError | None = None
     warning: StructuredError | None = None
 
+    @property
+    def is_superseded(self) -> bool:
+        """True when this row is a retained prior outcome, not the current truth.
+
+        A superseded row exists so section 6.7(9)'s successor keeps the prior
+        determined outcome visible; the current row for that document is the
+        byte-bearing record the successor committed.
+        """
+
+        return self.prior_outcome_manifest_id is not None
+
     @field_validator("study_id")
     @classmethod
     def validate_study_id(cls, value: str) -> str:
@@ -889,16 +961,20 @@ class ArtifactRecordProjection(ExtractionModel):
     """The identity + truthful content status of a document that owns no bytes.
 
     A determined ``EXTRACTION_FAILED``/``NO_TEXT_LAYER`` document still belongs
-    in the candidate set (``E2-NEG-014``), but it has no ``extracted_path`` and no
-    committed engine.  This projection is the minimal, explicit shape that carries
-    exactly those three identity fields plus the frozen content status, so the
-    candidate builder cannot accidentally reach into a record for a path.
+    in the candidate set (``E2-NEG-014``), but it has no ``extracted_path``.
+    This projection is the minimal, explicit shape that carries exactly those
+    three identity fields, the frozen content status, and the *mandatory*
+    ``extraction_method``: the frozen ``DocumentRecord`` requires a method on
+    every record (only ``extracted_path`` is conditional), so the builder
+    cannot accidentally reach into a record for a path and cannot drop the
+    method the way a failed document has no bytes.
     """
 
     document_id: str
     study_id: str
     source_sha256: str
     content_status: DocumentContentStatus
+    extraction_method: ExtractionMethod
 
     @field_validator("document_id")
     @classmethod
@@ -934,6 +1010,7 @@ class ArtifactRecordProjection(ExtractionModel):
             study_id=outcome.study_id,
             source_sha256=outcome.source_sha256,
             content_status=content_status,
+            extraction_method=determined_outcome_method(outcome.attempts),
         )
 
 
@@ -1132,17 +1209,58 @@ class ExtractionManifest(ExtractionModel):
             )
         if self.screening_decisions_ref.artifact_id[:4] == "ACQ-":
             raise ValueError("the screening parent reference must not target an ACQ-")
-        # One row per *document*, not per study: a single E1 study may commit
-        # several ``DOC-*`` records, and each one owns its own extraction truth.
-        # A row without a document identity is a pre-commit rejection that never
-        # reached a document, and it keeps ``""`` as its sort/order key.
+        # One *current* row per document, not per study: a single E1 study may
+        # commit several ``DOC-*`` records, and each one owns its own extraction
+        # truth.  A row without a document identity is a pre-commit rejection
+        # that never reached a document, and it keeps ``""`` as its sort/order key.
+        #
+        # Section 6.7(9) permits exactly one extra shape: a *superseded*
+        # non-byte-bearing row for a document that this sidecar supersedes.  Such
+        # a row is retained so the prior outcome stays visible by reference, and
+        # it must name the prior ``EXT-`` id and status it was superseded from --
+        # an unexplained second row for a document would be relabelled history.
         outcome_keys = [
             (item.study_id, item.document_id or "") for item in self.item_outcomes
         ]
-        if len(outcome_keys) != len(set(outcome_keys)):
-            raise ValueError("item outcomes must contain one row per document")
         if outcome_keys != sorted(outcome_keys):
             raise ValueError("item outcomes must be sorted deterministically")
+        current_keys = [
+            (item.study_id, item.document_id or "")
+            for item in self.item_outcomes
+            if not item.is_superseded
+        ]
+        if len(current_keys) != len(set(current_keys)):
+            raise ValueError("item outcomes must contain one current row per document")
+        for item in self.item_outcomes:
+            if not item.is_superseded:
+                continue
+            if item.document_id is None:
+                raise ValueError("a superseded outcome must carry a document identity")
+            if item.extraction_status in BYTE_BEARING_STATUSES:
+                raise ValueError(
+                    "a superseded outcome must be a non-byte-bearing prior status"
+                )
+            if (
+                item.prior_outcome_manifest_id is None
+                or item.prior_outcome_status is None
+            ):
+                raise ValueError(
+                    "a superseded outcome must reference its prior EXT- id and status"
+                )
+        # Section 6.7(9) retains the prior outcome *alongside* the new
+        # byte-bearing record, so a superseded row whose document has no current
+        # byte-bearing row in this sidecar is retained history for a recovery that
+        # never happened.
+        current_committed = {
+            item.document_id
+            for item in self.item_outcomes
+            if item.extraction_status in BYTE_BEARING_STATUSES
+        }
+        for item in self.item_outcomes:
+            if item.is_superseded and item.document_id not in current_committed:
+                raise ValueError(
+                    "a superseded outcome requires the successor record it was replaced by"
+                )
         record_order = [
             (record.study_id, record.document_id) for record in self.records
         ]
@@ -1168,11 +1286,18 @@ class ExtractionManifest(ExtractionModel):
             item.document_id
             for item in self.item_outcomes
             if item.extraction_status in BYTE_BEARING_STATUSES
+            and not item.is_superseded
         }
         if committed != {record.document_id for record in self.records}:
             raise ValueError("records and byte-bearing item outcomes must agree")
         by_document = {record.document_id: record for record in self.records}
         for outcome in self.item_outcomes:
+            if outcome.is_superseded:
+                # A retained superseded row is sidecar history: it states what a
+                # *prior* manifest claimed for this document, not what this
+                # manifest commits.  Binding it against the current record would
+                # make every section 6.7(9) successor commit unconstructible.
+                continue
             record = by_document.get(outcome.document_id or "")
             if record is None:
                 continue
@@ -1184,7 +1309,11 @@ class ExtractionManifest(ExtractionModel):
             ):
                 raise ValueError("outcome and record bindings must agree")
         committed_count = len(self.records)
-        requested_count = len(self.item_outcomes)
+        # A retained superseded row is sidecar history, not a requested document,
+        # so the batch-status invariants below count only the current rows.
+        requested_count = sum(
+            1 for item in self.item_outcomes if not item.is_superseded
+        )
         if self.operation.status is OperationStatus.SUCCESS:
             if committed_count != requested_count:
                 raise ValueError("SUCCESS sidecar requires every item to commit")

@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -62,10 +63,10 @@ print("child completed without crashing", file=sys.stderr)
 """
 
 
-def test_e2_sidecar_is_the_commit_marker_and_replay_is_idempotent(
+def test_e2_pos_002_exact_rerun_is_idempotent_and_never_re_extracts(
     tmp_path: Path,
 ) -> None:
-    """Re-running the same request reuses the sidecar and never re-extracts."""
+    """E2-POS-002: the sidecar is the commit marker and a rerun reuses it."""
 
     fixture = acquired_fixture(tmp_path)
     engine = usable_engine()
@@ -85,10 +86,10 @@ def test_e2_sidecar_is_the_commit_marker_and_replay_is_idempotent(
     assert len(engine.calls) == 1
 
 
-def test_e2_crash_before_sidecar_leaves_no_authoritative_output(
+def test_e2_neg_029_crash_before_sidecar_leaves_no_authoritative_output(
     tmp_path: Path,
 ) -> None:
-    """A crash between promotion and sidecar write leaves bytes but no claim.
+    """E2-NEG-029: a crash between promotion and sidecar write claims nothing.
 
     The promoted file is real content, but with no sidecar it is not
     authoritative.  Process death cannot run a cleanup handler, which is exactly
@@ -109,10 +110,10 @@ def test_e2_crash_before_sidecar_leaves_no_authoritative_output(
     assert not list((fixture.root / "literature" / "extraction").rglob("EXT-*.json"))
 
 
-def test_e2_fault_injection_leaves_no_partial_sidecar(
+def test_e2_neg_029b_fault_injection_leaves_no_partial_sidecar(
     tmp_path: Path,
 ) -> None:
-    """An abort before publication leaves no sidecar and no staging litter.
+    """E2-NEG-029: an abort before publication leaves no sidecar and no litter.
 
     The injected fault raises, exactly as a real abort would; what matters is
     that the workspace is left with no half-published claim.
@@ -134,8 +135,10 @@ def test_e2_fault_injection_leaves_no_partial_sidecar(
     assert not list((fixture.root / "extracted").glob("*.tmp"))
 
 
-def test_e2_sidecar_verification_detects_field_mutation(tmp_path: Path) -> None:
-    """Any sidecar field mutation fails verification (E2-NEG-009)."""
+def test_e2_neg_009_sidecar_verification_detects_field_mutation(
+    tmp_path: Path,
+) -> None:
+    """E2-NEG-009: any sidecar field mutation fails verification."""
 
     fixture = acquired_fixture(tmp_path)
     service = fixture.service(_registry())
@@ -160,7 +163,8 @@ def test_e2_sidecar_verification_detects_field_mutation(tmp_path: Path) -> None:
         service.verify_manifest(mutated, verify_bytes=True)
 
 
-def test_e2_audit_event_is_appended_once_per_commit(tmp_path: Path) -> None:
+def test_e2_neg_034_audit_event_is_appended_once_per_commit(tmp_path: Path) -> None:
+    """E2-NEG-034: the audit ledger is never double-logged by a replay."""
     fixture = acquired_fixture(tmp_path)
     audit = InMemoryAuditSink()
     service = fixture.service(_registry(), audit_sink=audit)
@@ -171,8 +175,8 @@ def test_e2_audit_event_is_appended_once_per_commit(tmp_path: Path) -> None:
     assert audit.events[0]["action"] == "PDF_TEXT_EXTRACTION"
 
 
-def test_e2_body_and_frontmatter_survive_a_restart(tmp_path: Path) -> None:
-    """After a crash, a fresh service re-verifies the committed file."""
+def test_e2_neg_017_body_and_frontmatter_survive_a_restart(tmp_path: Path) -> None:
+    """E2-NEG-017: a fresh service after restart re-verifies the committed file."""
 
     fixture = acquired_fixture(tmp_path)
     service = fixture.service(_registry())
@@ -193,12 +197,14 @@ def test_e2_body_and_frontmatter_survive_a_restart(tmp_path: Path) -> None:
     assert values["document_id"] == document_id
 
 
-def test_e2_pos_005_clean_isolated_wheel_import_and_help(tmp_path: Path) -> None:
-    """The E2 surface installs, imports, and answers --help from a clean wheel.
+def test_e2_pos_004_clean_isolated_wheel_import_and_help(tmp_path: Path) -> None:
+    """E2-POS-004/E2-NEG-031: the E2 surface installs and answers --help cleanly.
 
     PDF-012: `pyyaml` is declared, so a minimal install of the wheel alone must
     be able to import the extraction package and drive the CLI, with none of the
-    heavy engine extras installed.
+    heavy engine extras installed.  The wheel's own metadata is checked offline
+    first: an *undeclared* dependency is exactly the PDF-012 defect, and it
+    would otherwise only surface as a network-dependent install failure.
     """
 
     uv = shutil.which("uv")
@@ -230,6 +236,33 @@ def test_e2_pos_005_clean_isolated_wheel_import_and_help(tmp_path: Path) -> None
     assert build.returncode == 0, build.stdout + build.stderr
     wheels = list(wheel_directory.glob("scholar_pdf_kit-*.whl"))
     assert len(wheels) == 1
+
+    # PDF-012 / E2-NEG-031: the declared dependencies are read straight out of
+    # the built artifact, offline, so an undeclared YAML dependency cannot pass
+    # unnoticed.  E2-POS-004 additionally requires the clean environment to work
+    # without heavy engines, so the optional Docling/TEI stack may only appear
+    # behind an extra marker; `pymupdf`/`requests` stay core on the E1/PDF-012
+    # precedent, and their laziness is proven by the import check below.
+    with zipfile.ZipFile(wheels[0]) as archive:
+        metadata_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
+        assert len(metadata_names) == 1, sorted(archive.namelist())
+        metadata = archive.read(metadata_names[0]).decode("utf-8")
+    required = [
+        line.split(":", 1)[1].strip().lower()
+        for line in metadata.splitlines()
+        if line.lower().startswith("requires-dist:")
+    ]
+    assert any(requirement.startswith("pyyaml") for requirement in required), (
+        f"the wheel must declare its YAML dependency offline: {required}"
+    )
+    for optional in ("docling", "lxml"):
+        assert all(
+            "extra ==" in requirement
+            for requirement in required
+            if requirement.startswith(optional)
+        ), f"{optional} must stay behind an extra: {required}"
 
     create_environment = run(
         [uv, "venv", "--python", sys.executable, str(environment_directory)],

@@ -113,11 +113,14 @@ def _print_extraction_human(outcome) -> None:
         diagnostic = item.error.code if item.error is not None else ""
         if not diagnostic and item.warning is not None:
             diagnostic = item.warning.code
-        engine = item.method.engine.value if item.method is not None else "-"
+        # The engine that actually produced the outcome: an item outcome exposes
+        # `effective_engine` (the committed engine) and falls back to the
+        # requested one when the chain never reached an effective engine.
+        engine = item.effective_engine or item.requested_engine or "-"
         table.add_row(
             item.study_id,
             item.extraction_status.value,
-            item.content_status.value,
+            item.content_status.value if item.content_status is not None else "-",
             item.document_id or "-",
             engine,
             diagnostic,
@@ -129,12 +132,19 @@ def _print_extraction_human(outcome) -> None:
         console.print(
             f"Sidecar: {reference.manifest_id} ({reference.workspace_relative_path})"
         )
-    candidate = outcome.data.document_manifest_candidate
+    # `ExtractionOperationData` exposes the candidate as `candidate`; there is no
+    # `document_manifest_candidate` attribute, so naming the wrong one would raise
+    # an AttributeError on every real run.
+    candidate = outcome.data.candidate
     if candidate is not None:
+        # A candidate is an in-memory payload, not a file: it has no workspace
+        # path, so only its identity and payload checksum are reported.  The
+        # kit never publishes it and never claims Contract acceptance.
         console.print(
             "Contract candidate: "
-            f"{candidate.artifact_id} at {candidate.workspace_relative_path} "
-            "(NON-AUTHORITATIVE; not registered or accepted)"
+            f"{candidate.artifact_id} "
+            f"payload_sha256={candidate.payload_sha256} "
+            f"(NON-AUTHORITATIVE; acceptance={candidate.contract_acceptance})"
         )
     for error in outcome.errors:
         console.print(f"[red]{error.code}:[/red] {error.message}")

@@ -26,7 +26,6 @@ from typing import Any
 
 from .acquisition_models import (
     AcceptedParentBinding,
-    ArtifactReference,
     ProducerProvenance,
 )
 from .canonical import canonical_fingerprint
@@ -39,6 +38,7 @@ from .extraction_models import (
     ArtifactRecordProjection,
     DocumentManifestCandidate,
     ExtractedDocumentRecord,
+    ExtractionMethod,
     project_content_status,
 )
 
@@ -67,9 +67,16 @@ DOCUMENT_RECORD_KEYS = (
     "extraction_method",
 )
 
-#: ``extraction_method`` is required only for a byte-bearing record; a
-#: ``FAILED``/``NEEDS_OCR`` record legitimately has no committed engine.
-OPTIONAL_DOCUMENT_RECORD_KEYS = ("extracted_path", "extraction_method")
+#: Only ``extracted_path`` is conditional in the frozen ``DocumentRecord``
+#: (models.py:503-510): it is present for ``VALID``/``PARTIAL`` and absent for
+#: ``FAILED``/``NEEDS_OCR``.  ``extraction_method`` is required on *every* record,
+#: so a failed or no-text-layer document still records how its outcome was
+#: reached.  Treating the method as optional here made the kit validator accept a
+#: payload the frozen model rejects with ``Field required``.
+OPTIONAL_DOCUMENT_RECORD_KEYS = ("extracted_path",)
+
+#: The frozen ``extraction_method`` vocabulary (``MethodProvenance``).
+DOCUMENT_RECORD_METHODS = frozenset(method.value for method in ExtractionMethod)
 
 _ARTIFACT_ID_PREFIX = "ART-"
 _ALGORITHM_VERSION = "v1"
@@ -159,9 +166,15 @@ def failed_document_record(
 ) -> dict[str, Any]:
     """Build the truthful ``FAILED``/``NEEDS_OCR`` frozen record for a failure.
 
-    ``extracted_path`` and ``extraction_method`` are *absent* rather than null:
-    the frozen model requires a path only for ``VALID``/``PARTIAL``, and
-    inventing one for a failed document is the fabrication ``E2-NEG-014`` names.
+    ``extracted_path`` is *absent* rather than null: the frozen model requires a
+    path only for ``VALID``/``PARTIAL``, and inventing one for a failed document
+    is the fabrication ``E2-NEG-014`` names.
+
+    ``extraction_method`` is emitted on every record, including this one, because
+    the frozen model requires it unconditionally.  Its value comes from the
+    projection, which derives it from the attempts that actually ran
+    (``determined_outcome_method``), so a failed document states how its outcome
+    was reached instead of being silently stripped of provenance.
     """
 
     payload: dict[str, Any] = {
@@ -169,6 +182,7 @@ def failed_document_record(
         "study_id": projection.study_id,
         "source_hash": projection.source_sha256,
         "content_status": projection.content_status,
+        "extraction_method": projection.extraction_method.value,
     }
     if projection.content_status not in {"FAILED", "NEEDS_OCR"}:
         raise CandidateContractError(
@@ -240,12 +254,19 @@ def build_document_manifest_candidate(
             "CANDIDATE_RECORD_STATUS",
             "content_status is outside the frozen content-status enum",
         )
+        # extraction_method is required on EVERY record, so it is checked before
+        # the path check and never relaxed for a failed document.
+        _require(
+            isinstance(document.get("extraction_method"), str)
+            and document["extraction_method"] in DOCUMENT_RECORD_METHODS,
+            "CANDIDATE_RECORD_METHOD",
+            "every candidate document requires a frozen extraction_method",
+        )
         if document["content_status"] in {"FAILED", "NEEDS_OCR"}:
             _require(
-                "extracted_path" not in document
-                and "extraction_method" not in document,
+                "extracted_path" not in document,
                 "CANDIDATE_FAILED_RECORD_PATH",
-                "a FAILED/NEEDS_OCR document must omit extracted_path and method",
+                "a FAILED/NEEDS_OCR document must omit extracted_path",
             )
         else:
             _require(
@@ -425,12 +446,23 @@ def validate_document_manifest_candidate(
             "each candidate document must be a mapping",
         )
         _reject_unknown(document, DOCUMENT_RECORD_KEYS, "a candidate document")
-        for key in ("document_id", "study_id", "source_hash", "content_status"):
+        for key in (
+            "document_id",
+            "study_id",
+            "source_hash",
+            "content_status",
+            "extraction_method",
+        ):
             _require(
                 isinstance(document.get(key), str) and bool(document.get(key)),
                 "CANDIDATE_DOCUMENT_INVALID",
                 f"a candidate document requires a {key}",
             )
+        _require(
+            document["extraction_method"] in DOCUMENT_RECORD_METHODS,
+            "CANDIDATE_RECORD_METHOD",
+            "extraction_method must be a frozen MethodProvenance value",
+        )
         for key in OPTIONAL_DOCUMENT_RECORD_KEYS:
             _require_optional_str(document.get(key), f"a candidate document {key}")
         status = document["content_status"]
@@ -448,41 +480,22 @@ def validate_document_manifest_candidate(
         seen.add(identity)
         if status in {"VALID", "PARTIAL"}:
             _require(
-                bool(document.get("extracted_path"))
-                and bool(document.get("extraction_method")),
+                bool(document.get("extracted_path")),
                 "CANDIDATE_VALID_RECORD_PATH",
-                "a VALID/PARTIAL document requires extracted_path and method",
+                "a VALID/PARTIAL document requires extracted_path",
             )
         else:
+            # The frozen model makes only extracted_path conditional: a
+            # FAILED/NEEDS_OCR record must omit the path but keeps its method.
             _require(
-                document.get("extracted_path") is None
-                and document.get("extraction_method") is None,
+                document.get("extracted_path") is None,
                 "CANDIDATE_FAILED_RECORD_PATH",
-                "a FAILED/NEEDS_OCR document must omit extracted_path and method",
+                "a FAILED/NEEDS_OCR document must omit extracted_path",
             )
     _require(
         candidate.payload_sha256 == canonical_fingerprint(payload),
         "CANDIDATE_CHECKSUM_MISMATCH",
         "the candidate payload checksum does not match the payload",
-    )
-
-
-def reference_for_candidate(candidate: DocumentManifestCandidate) -> ArtifactReference:
-    """Build a *candidate* reference for handing the payload to a caller.
-
-    This is deliberately the frozen ``ArtifactReference`` shape
-    (``artifact_id``/``path``/``sha256``) and deliberately *not* an
-    accepted-artifact reference: the candidate's own
-    ``contract_acceptance = "not_performed_by_kit"`` is the only acceptance
-    claim this kit makes, and the extraction envelope publishes no artifact
-    reference at all.  A harness adapter performing ``accept_artifact`` is the
-    only thing that can turn this into an authoritative artifact.
-    """
-
-    return ArtifactReference(
-        artifact_id=candidate.artifact_id,
-        path=f"literature/extraction/candidates/{candidate.artifact_id}.json",
-        sha256=candidate.payload_sha256,
     )
 
 

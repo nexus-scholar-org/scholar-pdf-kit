@@ -144,12 +144,17 @@ uv run scholar-pdf extract-run extraction-config.json \
   --audit-logger /path/to/workspace-manager/scripts/log_event.py
 ```
 
-Engine selection is explicit and ordered: `PYMUPDF` → `DOCLING` → `GROBID`.
-The first engine that yields usable text wins; every attempted engine, its
-version, output format, and any fallback reason is recorded in the sidecar. A
-missing optional engine is reported as an engine failure with a reason, never as
-a successful empty result. Engines are optional extras (`extract`); importing
-`scholar_pdf` does not import them.
+The requested engine is run first and the first engine that yields usable text
+wins. When the requested engine is unavailable and the request permits a
+fallback, the **only** fallback target is `PYMUPDF`
+(`DEFAULT_ENGINE_FALLBACK_ORDER`), so a `DOCLING` request degrades to
+`PYMUPDF`; `GROBID` is never substituted automatically because it is an
+external provider that must be addressed explicitly. Every attempted engine,
+its version, output format, and any fallback reason is recorded in the sidecar,
+so `effective != requested` is never silent. A missing optional engine is
+reported as an engine failure with a reason, never as a successful empty
+result. Engines are optional extras (`extract`); importing `scholar_pdf` does
+not import them.
 
 The sidecar at `literature/extraction/<extraction_run_id>/<extraction_id>.json`
 records the acquisition parent, screening parent, engine provenance,
@@ -171,9 +176,12 @@ templates are not counted as text.
 
 The sidecar may also carry a **non-authoritative** Contract v1 document-manifest
 candidate. It is emitted only when a usable text file was committed, and it
-always carries `acceptance_state = not_performed_by_kit`: the kit does not
-validate or accept Contract v1 artifacts. A run that commits no bytes emits a
-failure sidecar and no candidate.
+always carries `contract_acceptance = "not_performed_by_kit"`: the kit does not
+validate or accept Contract v1 artifacts. Every candidate `DocumentRecord`
+carries a non-null `extraction_method` (the frozen model requires it on all
+records; only `extracted_path` is conditional), and a `FAILED`/`NEEDS_OCR`
+record omits `extracted_path` rather than inventing one. A run that commits no
+bytes emits a failure sidecar and no candidate.
 
 The programmatic entry point is
 `PDFExtractionService.extract(requests, ...)`. Use `EngineRegistry` with the
