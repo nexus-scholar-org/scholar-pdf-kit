@@ -29,9 +29,16 @@ from .acquisition_models import AcquisitionRunConfig, OperationStatus
 from .config import settings
 from .downloader import AsyncPDFDownloader
 from .extract import DoclingEngine, GrobidEngine
+from .extraction import PDFExtractionService
+from .extraction_models import ExtractionRunConfig
 from .publisher_patterns import PROXY_STYLES
 
-app = typer.Typer(help="Scholar PDF Kit: automated PDF discovery and acquisition.")
+app = typer.Typer(
+    help=(
+        "Scholar PDF Kit: automated PDF discovery, deterministic acquisition, "
+        "and parent-bound text extraction."
+    )
+)
 console = Console()
 
 _ACQUISITION_EXIT_CODES = {
@@ -90,6 +97,105 @@ def _print_acquisition_human(outcome) -> None:
         )
     for error in outcome.errors:
         console.print(f"[red]{error.code}:[/red] {error.message}")
+
+
+def _print_extraction_human(outcome) -> None:
+    """Render the canonical E2 envelope without changing its status values."""
+
+    table = Table(title="PDF Text Extraction (WP01-E2)")
+    table.add_column("Study", style="cyan")
+    table.add_column("Extraction")
+    table.add_column("Content")
+    table.add_column("Document")
+    table.add_column("Engine")
+    table.add_column("Diagnostic")
+    for item in outcome.data.item_outcomes:
+        diagnostic = item.error.code if item.error is not None else ""
+        if not diagnostic and item.warning is not None:
+            diagnostic = item.warning.code
+        # The engine that actually produced the outcome: an item outcome exposes
+        # `effective_engine` (the committed engine) and falls back to the
+        # requested one when the chain never reached an effective engine.
+        engine = item.effective_engine or item.requested_engine or "-"
+        table.add_row(
+            item.study_id,
+            item.extraction_status.value,
+            item.content_status.value if item.content_status is not None else "-",
+            item.document_id or "-",
+            engine,
+            diagnostic,
+        )
+    console.print(table)
+    console.print(f"Operation status: {outcome.status.value}")
+    reference = outcome.data.manifest_reference
+    if reference is not None:
+        console.print(
+            f"Sidecar: {reference.manifest_id} ({reference.workspace_relative_path})"
+        )
+    # `ExtractionOperationData` exposes the candidate as `candidate`; there is no
+    # `document_manifest_candidate` attribute, so naming the wrong one would raise
+    # an AttributeError on every real run.
+    candidate = outcome.data.candidate
+    if candidate is not None:
+        # A candidate is an in-memory payload, not a file: it has no workspace
+        # path, so only its identity and payload checksum are reported.  The
+        # kit never publishes it and never claims Contract acceptance.
+        console.print(
+            "Contract candidate: "
+            f"{candidate.artifact_id} "
+            f"payload_sha256={candidate.payload_sha256} "
+            f"(NON-AUTHORITATIVE; acceptance={candidate.contract_acceptance})"
+        )
+    for error in outcome.errors:
+        console.print(f"[red]{error.code}:[/red] {error.message}")
+
+
+@app.command("extract-run")
+def extract_run(
+    config: Path = typer.Argument(
+        ..., exists=True, readable=True, help="ExtractionRunConfig JSON input."
+    ),
+    audit_logger: Path = typer.Option(
+        ...,
+        "--audit-logger",
+        exists=True,
+        readable=True,
+        help="Canonical workspace-manager log_event.py path.",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o", help="Optional path for the JSON summary."
+    ),
+    human: bool = typer.Option(
+        False, "--human", help="Render a human table in addition to JSON output."
+    ),
+) -> None:
+    """Extract screened PDF text through the E2 domain service (authoritative)."""
+
+    try:
+        run_config = ExtractionRunConfig.model_validate_json(
+            config.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise typer.BadParameter(
+            f"could not read a valid ExtractionRunConfig: {error}"
+        ) from error
+
+    if not run_config.requests:
+        raise typer.BadParameter("ExtractionRunConfig.requests must not be empty")
+
+    audit_sink = WorkspaceManagerCliAuditSink(
+        workspace_root=run_config.requests[0].workspace_root,
+        logger_path=audit_logger,
+    )
+    service = PDFExtractionService.from_config(run_config, audit_sink=audit_sink)
+    outcome = asyncio.run(service.extract(run_config.requests))
+    serialized = outcome.model_dump_json(indent=2)
+    if output is not None:
+        _write_json_atomic(output, serialized)
+    typer.echo(serialized)
+    if human:
+        _print_extraction_human(outcome)
+    raise typer.Exit(code=_ACQUISITION_EXIT_CODES[outcome.status])
 
 
 @app.command("acquire")
@@ -439,8 +545,19 @@ def extract(
         "http://localhost:8070", help="Grobid service URL if using grobid"
     ),
 ):
-    """Extract raw Markdown from a PDF using Docling or Grobid."""
+    """LEGACY, NON-AUTHORITATIVE: extract raw Markdown from a PDF.
 
+    This command writes to an arbitrary output directory and produces no
+    acquisition/extraction lineage, no bound frontmatter, and no sidecar
+    manifest. It can never write the authoritative `extracted/<document_id>.md`
+    contract path. Use `extract-run` for the WP01-E2 deterministic pipeline.
+    """
+
+    console.print(
+        "[bold yellow]Warning:[/bold yellow] 'extract' is non-authoritative. "
+        "Outputs are unversioned and untraceable to a screened document. "
+        "Use 'extract-run' for the WP01-E2 deterministic pipeline."
+    )
     if not pdf_path.exists():
         console.print(f"[red]Path does not exist: {pdf_path}[/red]")
         raise typer.Exit(1)

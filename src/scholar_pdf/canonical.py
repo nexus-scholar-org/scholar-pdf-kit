@@ -244,3 +244,68 @@ def deterministic_acquisition_manifest_id(
     }
     suffix = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()[:32]
     return f"ACQ-{suffix}"
+
+
+def extraction_identity_payload(
+    *,
+    schema_version: str,
+    workspace_id: str,
+    run_id: str,
+    acquisition_manifest_ref: Mapping[str, Any],
+    extraction_records: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the E2 ``EXT-`` identity payload over normalized extraction records.
+
+    The records are supplied already reduced to their non-volatile projection by
+    the extraction service (see ``PDFExtractionService._stable_extraction_records``),
+    so timestamps, attempt ordinals, and retry counters cannot reach the identity
+    even if a caller hands this helper a richer record.  Ordering is normalized
+    here as well, so document input order and attempt order never move the id.
+    """
+
+    if schema_version != "pdf-extraction-manifest-v1":
+        raise ValueError("unsupported extraction manifest identity schema version")
+    normalized = sorted(
+        (dict(record) for record in extraction_records),
+        key=lambda record: (
+            str(record.get("study_id", "")),
+            str(record.get("document_id") or ""),
+        ),
+    )
+    return {
+        "acquisition_manifest_ref": dict(acquisition_manifest_ref),
+        "extraction_records": normalized,
+        "run_id": run_id,
+        "schema_version": schema_version,
+        "workspace_id": workspace_id,
+    }
+
+
+def deterministic_extraction_manifest_id(
+    *,
+    schema_version: str,
+    workspace_id: str,
+    run_id: str,
+    acquisition_manifest_ref: Mapping[str, Any],
+    extraction_records: Iterable[Mapping[str, Any]],
+    algorithm_version: str = "v1",
+) -> str:
+    """Mint ``EXT-*`` over the normalized set-like extraction identities.
+
+    Mirrors :func:`deterministic_acquisition_manifest_id` so the E2 sidecar has the
+    same shape of deterministic identity as the E1 manifest it descends from, and
+    so the two identities stay distinguishable by prefix while sharing one
+    formula style.
+    """
+
+    if algorithm_version != "v1":
+        raise ValueError("unsupported extraction manifest identity algorithm version")
+    payload = extraction_identity_payload(
+        schema_version=schema_version,
+        workspace_id=workspace_id,
+        run_id=run_id,
+        acquisition_manifest_ref=acquisition_manifest_ref,
+        extraction_records=extraction_records,
+    )
+    suffix = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()[:32]
+    return f"EXT-{suffix}"

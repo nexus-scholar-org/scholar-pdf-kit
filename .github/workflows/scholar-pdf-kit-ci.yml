@@ -4,14 +4,15 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - 'scholar-pdf-kit/**'
-      - 'slr-search-kit/**'
-      - '.github/workflows/scholar-pdf-kit-ci.yml'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/**'
   pull_request:
     branches: [ "main" ]
     paths:
-      - 'scholar-pdf-kit/**'
-      - 'slr-search-kit/**'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/**'
 
 jobs:
   test:
@@ -33,12 +34,14 @@ jobs:
     - name: Set up Python ${{ matrix.python-version }}
       run: uv python install ${{ matrix.python-version }}
 
+    - name: Create virtual environment
+      run: uv venv --python ${{ matrix.python-version }}
+
     - name: Install dependencies
-      working-directory: ./scholar-pdf-kit
       run: |
         uv pip install -e .[dev]
+        uv pip install "scholar-search-kit @ git+https://github.com/nexus-scholar-org/scholar-search-kit.git@911d864fcb6a706d4c0339f80524a46f591e2cad"
 
     - name: Run pytest
-      working-directory: ./scholar-pdf-kit
       run: |
-        uv run pytest tests/ -v
+        uv run --frozen pytest tests/ -v
