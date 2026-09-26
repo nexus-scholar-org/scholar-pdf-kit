@@ -2414,6 +2414,61 @@ def test_e2_neg_017_replay_recomputes_and_a_changed_body_is_never_republished(
     assert fixture.extracted().read_bytes() == committed_bytes
 
 
+def test_e2_neg_043_no_filename_url_or_regex_metadata_is_invented(
+    tmp_path: Path,
+) -> None:
+    """E2-NEG-043: a heuristic title/DOI/workspace never becomes authoritative.
+
+    The legacy `_pdf_metadata` path still guesses a title from the file stem, a
+    DOI by regex over the stem, and a workspace id by regex over the path, and
+    E2 does not remove that behaviour.  What E2 forbids is those guesses
+    reaching an authoritative frontmatter, sidecar, or candidate, so the
+    authoritative run is driven from a filename and a path that would each
+    invite a guess and must still record none.
+    """
+
+    fixture = acquired_fixture(tmp_path / "SCI-42-some_paper-10.1000_zzz")
+    source = fixture.root / fixture.record().workspace_relative_path
+    assert source.stem == fixture.record().document_id, (
+        "the stem must be identity-addressed"
+    )
+
+    outcome = asyncio.run(
+        fixture.service(
+            EngineRegistry({ExtractionEngine.PYMUPDF: usable_engine()})
+        ).extract([fixture.request()])
+    )
+
+    assert outcome.status is OperationStatus.SUCCESS
+    values, _body = parse_bound_frontmatter(fixture.extracted().read_bytes())
+    # The declared workspace binds; nothing is read out of the directory name.
+    assert values["workspace_id"] == "WSP-test"
+    assert "SCI-42" not in values["workspace_id"]
+    for heuristic in ("some_paper", "10.1000_zzz", "10.1000/zzz", "SCI-42"):
+        assert heuristic not in str(values), heuristic
+    assert not values.get("title"), "no caller-supplied title means no title"
+    # The DOI is the E1 record's, never a regex guess read out of the stem.
+    assert values["doi"] == fixture.record().normalized_doi
+    assert values["doi"] != "10.1000/zzz"
+
+    manifest = fixture.sidecar(outcome)
+    record = manifest.records[0]
+    # The record carries no bibliographic field of its own, so a heuristic
+    # title or DOI has nowhere to hide there.
+    assert not hasattr(record, "title")
+    assert not hasattr(record, "doi")
+    candidate = outcome.data.candidate
+    assert candidate is not None
+    payload = candidate.model_dump(mode="json")["payload"]
+    assert "SCI-42" not in str(payload)
+    assert "10.1000_zzz" not in str(payload)
+    # The frozen `DocumentRecord` has no bibliographic field, so the candidate
+    # carries identity and provenance only -- and no invented title or DOI.
+    document = payload["data"]["documents"][0]
+    assert set(document) <= set(DOCUMENT_RECORD_KEYS)
+    assert "10.1000" not in str(document)
+
+
 def test_e2_neg_040_committed_content_mutation_is_not_republished(
     tmp_path: Path,
 ) -> None:
