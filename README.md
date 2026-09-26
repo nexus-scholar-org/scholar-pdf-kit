@@ -168,11 +168,17 @@ cancelled run still publishes a sidecar (with no committed output) so the
 outcome is never silently lost.
 
 Replaying the same semantic request is idempotent and returns `REUSED` without
-re-running engines. A different request in the same run, stale parent lineage,
-changed bound bytes, or path traversal fails closed with a typed error. Usable
-text is defined by a versioned `usability-profile` (minimum character count and
-legacy-stub detection) applied to the frontmatter-separated body, so structural
-templates are not counted as text.
+re-running engines. One exception is a repair: if a document that previously
+committed a determined failure (`EXTRACTION_FAILED`, `NO_TEXT_LAYER`) is re-run in
+a different engine environment, the document already holding bytes is carried
+unchanged, the failed sibling is re-driven, and a recovered document keeps the
+same idempotency key under a new `EXT-` id, with the superseded failure row
+retained in the sidecar. A rerun that recovers nothing republishes nothing. A
+different request in the same run, stale parent lineage, changed bound bytes, or
+path traversal fails closed with a typed error. Usable text is defined by a
+versioned `usability-profile` (minimum character count and legacy-stub detection)
+applied to the frontmatter-separated body, so structural templates are not
+counted as text.
 
 The sidecar may also carry a **non-authoritative** Contract v1 document-manifest
 candidate. It is emitted only when a usable text file was committed, and it

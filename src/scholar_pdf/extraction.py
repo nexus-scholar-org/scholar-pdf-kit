@@ -176,6 +176,27 @@ EXTRACTED_SUFFIXES = {
 #: never a silent reuse.  They are recorded per attempt in ``request_shape``.
 NON_KEYED_REQUEST_KEYS = ("grobid_url", "page_range")
 
+#: Section 6.7(9) names the two determined statuses a retry may supersede.
+#: ``CANCELLED`` was never an authoritative determination and a ``FAILED`` commit
+#: row is a rejection rather than a determination, so neither is a supersedable
+#: prior outcome of a byte-bearing commit.
+SUPERSEDABLE_DETERMINED_STATUSES = frozenset(
+    {ExtractionStatus.EXTRACTION_FAILED, ExtractionStatus.NO_TEXT_LAYER}
+)
+
+#: The fallback reasons that mean "this engine could not run here at all".  They
+#: are what makes a repair *observable without running an engine*: whether an
+#: adapter resolves now is a cheap probe, so a provider that came back up, an
+#: engine installed since, or a library whose version moved is a deterministically
+#: detectable environment change rather than a guess.
+AVAILABILITY_FALLBACK_REASONS = frozenset(
+    {
+        FallbackReason.ENGINE_NOT_INSTALLED,
+        FallbackReason.ENGINE_UNAVAILABLE,
+        FallbackReason.ENGINE_LICENSE_MISSING,
+    }
+)
+
 
 class ExtractionFault(StrEnum):
     """Deterministic fault-injection points for the E2 atomicity tests."""
@@ -378,13 +399,33 @@ class PDFExtractionService:
         async with lock:
             with self._extraction_publication_lock(first.workspace_root):
                 try:
-                    replay, prior = self._find_run_replay(
+                    replay, prior, carried = self._find_run_replay(
                         first.workspace_root,
                         first.request.run_id,
                         first.idempotency_key,
                     )
                 except ExtractionPreflightError as error:
                     return self._preflight_failure(snapshot, error)
+                if replay is not None and carried:
+                    # Section 6.7(9) successor over a *byte-bearing* commit: a
+                    # sibling is re-driven because its repair is observable, so
+                    # the published records are carried rather than re-extracted
+                    # and the run may mint a new ``EXT-`` id under this key.
+                    try:
+                        self._verify_replay_inputs(replay[0], prepared)
+                        self.verify_manifest(replay[0], verify_bytes=True)
+                        return await self._extract_locked(
+                            prepared,
+                            prior_outcomes=prior,
+                            carried=carried,
+                            prior_replay=replay,
+                        )
+                    except ExtractionPreflightError as error:
+                        return self._preflight_failure(snapshot, error)
+                    except ExtractionCommitError as error:
+                        return self._preflight_failure(
+                            snapshot, self._published_commit_rejection(replay[0], error)
+                        )
                 if replay is not None:
                     try:
                         return await self._replay_outcome(replay, prepared)
@@ -399,18 +440,31 @@ class PDFExtractionService:
                         # (acquisition.py:600-607).
                         return self._preflight_failure(
                             snapshot,
-                            ExtractionPreflightError(
-                                "REPLAY_VERIFICATION_FAILED",
-                                (
-                                    "A matching extraction sidecar failed byte, "
-                                    "checksum, or lineage verification."
-                                ),
-                                manifest_id=replay[0].manifest_id,
-                                manifest_checksum=replay[0].artifact_checksum,
-                                failure_code=error.code,
-                            ),
+                            self._published_commit_rejection(replay[0], error),
                         )
                 return await self._extract_locked(prepared, prior_outcomes=prior)
+
+    @staticmethod
+    def _published_commit_rejection(
+        manifest: ExtractionManifest, error: ExtractionCommitError
+    ) -> ExtractionPreflightError:
+        """Map a published commit's failed byte/checksum verification.
+
+        The published sidecar is the commit marker, so a body, bound source, or
+        lineage that no longer verifies is a fail-closed replay rejection rather
+        than an exception that escapes the public API (``E2-NEG-017`` /
+        ``E2-NEG-040``).  This mirrors E1's ``REPLAY_VERIFICATION_FAILED``
+        precedent (``acquisition.py:600-607``).
+        """
+
+        return ExtractionPreflightError(
+            "REPLAY_VERIFICATION_FAILED",
+            "A matching extraction sidecar failed byte, checksum, or lineage "
+            "verification.",
+            manifest_id=manifest.manifest_id,
+            manifest_checksum=manifest.artifact_checksum,
+            failure_code=error.code,
+        )
 
     def verify_manifest(
         self, manifest: ExtractionManifest, *, verify_bytes: bool
@@ -871,8 +925,9 @@ class PDFExtractionService:
     ) -> tuple[
         tuple[ExtractionManifest, Path] | None,
         dict[str, tuple[str, ExtractionItemOutcome]],
+        dict[str, tuple[ExtractedDocumentRecord, ExtractionItemOutcome]],
     ]:
-        """Locate a published sidecar that already binds this exact request.
+        """Locate the published sidecars that bind this exact request.
 
         The replay lookup is keyed by the **recomputed deterministic ``EXT-`` id**,
         not by the request-side idempotency key alone (packet E2 section 7.4).
@@ -881,31 +936,40 @@ class PDFExtractionService:
         requested engine), while the ``EXT-`` id covers the normalized extraction
         records and therefore their outcomes.
 
-        A prior commit that binds at least one byte is a *replay* when its
-        recomputed ``EXT-`` id is self-consistent, which is exactly the case where
-        a rerun recomputes the same id: the committed records anchor the identity,
-        so section 7.4's "report ``REUSED`` without re-running the engine" applies
-        and a determined-failure row sitting beside them stays a recorded truth of
-        the published commit rather than a pending retry.  The persisted records
-        are re-verified against their own bytes on the replay path
-        (``_replay_outcome``), so a mutated body or source still fails closed
-        instead of being reported as ``REUSED`` (E2-NEG-017 / E2-NEG-040).
+        A prior commit that bound *no* bytes is the section 6.7(9) **successor**
+        case: a retry may now succeed, so it must mint a new ``EXT-`` id and must
+        never be reported as ``REUSED``.
 
-        A prior commit that bound *no* bytes is instead the section 6.7(9)
-        **successor** case: a retry may now succeed, so it must mint a new ``EXT-``
-        id and must never be reported as ``REUSED``.  Those superseded outcomes
-        are returned so the successor commit keeps them visible by reference.
+        A byte-bearing prior commit is *not* decided by its record count, because
+        section 7.4 is explicit that a run whose key matches but whose ``EXT-`` id
+        differs is a new commit rather than a replay.  A mixed commit therefore
+        holds both kinds of row, and the rows are decided one at a time:
+
+        * a document the prior commit holds bytes for is **final**: its record is
+          *carried* -- adopted verbatim after the published commit re-verifies --
+          and no engine runs for it again;
+        * a document the prior commit merely *determined* is re-driven only when
+          the engine environment observably changed
+          (:meth:`_engine_environment_changed`), and a repair that commits bytes
+          supersedes its prior row by reference (section 6.7(9)).
+
+        A carried document is only carried when at least one sibling is re-driven,
+        so the third element of the returned triple is non-empty exactly when this
+        call is asking for the successor path.  Afterwards the run publishes a
+        successor only if the re-drive recovered a document, which is what moves
+        the prospective ``EXT-`` id; an unchanged id stays the ``REUSED`` replay of
+        section 7.4.
 
         A changed non-volatile payload under an existing key remains
-        ``IDEMPOTENCY_CONFLICT``, and more than one byte-bearing commit for the
-        same key is ambiguous and also fails closed.
+        ``IDEMPOTENCY_CONFLICT``, and two unsuperseded byte-bearing commits for
+        the same key are ambiguous and also fail closed.
         """
 
         manifest_root = workspace_root / SIDECAR_STORAGE_PREFIX / run_id
         prior: dict[str, tuple[str, ExtractionItemOutcome]] = {}
         if not manifest_root.exists():
-            return None, prior
-        replay: tuple[ExtractionManifest, Path] | None = None
+            return None, prior, {}
+        matches: list[tuple[ExtractionManifest, Path]] = []
         try:
             canonical_root = manifest_root.resolve(strict=True)
         except OSError as error:
@@ -956,30 +1020,140 @@ class PDFExtractionService:
                     "An extraction sidecar does not recompute its own EXT- id.",
                     path=path.name,
                 )
+            prior.update(
+                {
+                    document: (manifest.manifest_id, outcome)
+                    for document, outcome in self._superseded_outcomes(manifest).items()
+                }
+            )
             if not manifest.records:
-                # Section 6.7(9) successor: this prior commit bound *no* bytes, so
-                # it anchored no ``EXT-`` identity.  A retry may now succeed, which
-                # mints a new id under the same key, so it must never be reported
-                # as ``REUSED`` nor as ``IDEMPOTENCY_CONFLICT``.  The superseded
-                # outcomes are returned so the successor commit keeps them visible
-                # by reference.
-                prior.update(
-                    {
-                        document: (manifest.manifest_id, outcome)
-                        for document, outcome in self._superseded_outcomes(
-                            manifest
-                        ).items()
-                    }
-                )
+                # Nothing to carry and nothing to replay: this commit anchored no
+                # ``EXT-`` identity, so a retry may mint a new one under the same
+                # key and its prior outcomes are returned for section 6.7(9).
                 continue
-            if replay is not None:
-                raise ExtractionPreflightError(
-                    "IDEMPOTENCY_CONFLICT",
-                    "The run contains more than one matching extraction sidecar.",
-                    manifest_id=manifest.manifest_id,
-                )
-            replay = (manifest, path)
-        return replay, prior
+            matches.append((manifest, path))
+        if not matches:
+            return None, prior, {}
+        # A section 6.7(9) successor chain leaves several same-key commits behind.
+        # The authoritative one is the tip: the commit no other same-key sidecar
+        # supersedes by reference.  More than one tip means the chain is
+        # ambiguous, which is a fail-closed conflict rather than a guess.
+        superseded = {
+            outcome.prior_outcome_manifest_id
+            for manifest, _ in matches
+            for outcome in manifest.item_outcomes
+            if outcome.prior_outcome_manifest_id is not None
+        }
+        tips = [match for match in matches if match[0].manifest_id not in superseded]
+        if len(tips) != 1:
+            raise ExtractionPreflightError(
+                "IDEMPOTENCY_CONFLICT",
+                "The run contains more than one unsuperseded extraction sidecar.",
+                manifest_ids=sorted(match[0].manifest_id for match in tips),
+            )
+        replay = tips[0]
+        return replay, prior, self._carried_records(replay[0])
+
+    def _carried_records(
+        self, manifest: ExtractionManifest
+    ) -> dict[str, tuple[ExtractedDocumentRecord, ExtractionItemOutcome]]:
+        """Return the records a repair rerun adopts instead of re-extracting.
+
+        A byte-bearing commit is final (section 7.5: a valid existing output is
+        never replaced by a different identity), so its documents are carried:
+        the record and its current row are adopted verbatim, which keeps the
+        document's ``extracted_sha256``/``extracted_file_sha256`` describing the
+        bytes that are actually on disk and keeps exactly one byte-bearing record
+        per document (section 6.7(9)).
+
+        Adoption is only offered when a sibling is re-driven, because that is the
+        only way the prospective ``EXT-`` id can move: with nothing re-driven the
+        run is the exact replay section 7.4 reports as ``REUSED``, and re-running
+        an engine to rediscover that would break the rule that a verified replay
+        runs no engine.  Only the two *determined* failures are re-driven, and only
+        under :meth:`_engine_environment_changed`: ``EXTRACTION_CANCELLED`` is not
+        retried, and a ``NEEDS_REVIEW`` row is not a determined failure at all.
+
+        That comparison is recorded-against-current rather than run-against-run,
+        because a published commit is frozen.  So when a re-drive recovers nothing
+        the commit is reported unchanged, the record of the failing environment
+        never clears, and the next rerun retries that one document again: a bounded
+        retry of a single determined document per rerun, never a silent replay and
+        never a second commit.  That is the same retry semantic ``E2-NEG-018c``
+        pins for a commit that owns no bytes at all.
+        """
+
+        current = {
+            outcome.document_id: outcome
+            for outcome in manifest.item_outcomes
+            if not outcome.is_superseded
+        }
+        retryable = [
+            document
+            for document, outcome in current.items()
+            if outcome is not None
+            and outcome.extraction_status in SUPERSEDABLE_DETERMINED_STATUSES
+        ]
+        if not any(
+            self._engine_environment_changed(current[document])
+            for document in retryable
+        ):
+            return {}
+        return {
+            record.document_id: (record, current[record.document_id])
+            for record in manifest.records
+            if current.get(record.document_id) is not None
+        }
+
+    def _engine_environment_changed(self, prior: ExtractionItemOutcome) -> bool:
+        """Report whether the engine environment differs from a prior failure.
+
+        Section 7.4 forbids re-running an engine to rediscover an exact replay,
+        and the prospective ``EXT-`` id cannot be known without running one, so
+        the repair has to be *observable* first.  It is, for the two repairs the
+        failure modes describe:
+
+        * an engine that could not run at all (``ENGINE_NOT_INSTALLED``,
+          ``ENGINE_UNAVAILABLE``, ``ENGINE_LICENSE_MISSING``) either resolves now
+          or does not -- ``resolve()`` is a cheap, side-effect-free probe, so a
+          provider that came back up is detected;
+        * an engine that did run resolves to a different ``version()`` now, so an
+          upgraded or swapped library is detected.
+
+        An environment change that is invisible to both probes -- the same
+        adapter, the same version, the same availability -- leaves the published
+        commit the current truth, which is what section 7.4's replay means.
+        """
+
+        recorded: dict[str, str] = {}
+        for attempt in prior.attempts:
+            recorded[attempt.engine] = attempt.engine_version
+        unavailable = {
+            step.engine
+            for step in prior.fallback_chain
+            if step.reason in AVAILABILITY_FALLBACK_REASONS
+        }
+        if not recorded:
+            # No attempt ever ran against the verified bytes, so there is no
+            # recorded environment to compare: a retry is the only way to know.
+            return True
+        for engine_name, version in sorted(recorded.items()):
+            try:
+                adapter = self.engines.get(engine_name)
+            except UnsupportedExtractionEngine:
+                return True
+            try:
+                adapter.resolve()
+            except Exception:  # noqa: BLE001 - a probe never breaks the decision
+                if engine_name not in unavailable:
+                    # An engine that ran before cannot run now.
+                    return True
+                continue
+            if engine_name in unavailable:
+                return True
+            if self._engine_version(adapter) != version:
+                return True
+        return False
 
     @staticmethod
     def _superseded_outcomes(
@@ -987,9 +1161,9 @@ class PDFExtractionService:
     ) -> dict[str, ExtractionItemOutcome]:
         """Return this sidecar's non-byte-bearing outcomes, keyed by document.
 
-        Only a document that owns no bytes can be superseded; a byte-bearing
-        commit is already final, so a later run that recomputes a different
-        ``EXT-`` id for it is a genuine divergence rather than a successor.
+        Only a document that owns no bytes in this sidecar can be superseded: a
+        byte-bearing record is final and is *carried* into a successor commit,
+        while a row that owns no bytes is a determination a retry may replace.
 
         Rows that are *already* superseded are excluded: they are retained prior
         history inside this sidecar, and treating them as a fresh pending failure
@@ -1168,11 +1342,23 @@ class PDFExtractionService:
         self,
         prepared: Sequence[_PreparedExtraction],
         prior_outcomes: Mapping[str, tuple[str, ExtractionItemOutcome]] | None = None,
+        carried: Mapping[str, tuple[ExtractedDocumentRecord, ExtractionItemOutcome]]
+        | None = None,
+        prior_replay: tuple[ExtractionManifest, Path] | None = None,
     ) -> ExtractionBatchOutcome:
         first = prepared[0]
         staged: list[_StagedExtraction] = []
         for index, item in enumerate(prepared):
             for position, source in enumerate(item.documents):
+                adopted = None if carried is None else carried.get(source.document_id)
+                if adopted is not None:
+                    # Section 6.7(9): this document's commit is final and was just
+                    # re-verified against its own bytes, so it is carried into the
+                    # successor commit instead of running an engine a second time.
+                    staged.append(
+                        _StagedExtraction(record=adopted[0], outcome=adopted[1])
+                    )
+                    continue
                 try:
                     entries = self._extract_one_document(item, source)
                 except ExtractionCommitError as error:
@@ -1224,6 +1410,19 @@ class PDFExtractionService:
             outcomes = self._carry_superseded_outcomes(outcomes, prior_outcomes)
         status = self._operation_status(outcomes)
         manifest = self._build_manifest(prepared, records, outcomes, status)
+        if prior_replay is not None:
+            # Section 7.4: the replay lookup is keyed by the recomputed ``EXT-`` id,
+            # so this run is a new commit only when that id moved.  It moved only
+            # when the repair recovered a document: a superseded row exists exactly
+            # when a document that owned no bytes now owns a record (6.7(9)), so a
+            # re-drive that merely re-recorded a failure leaves every document's
+            # state as published and must not mint an unlinked second sidecar --
+            # nothing would supersede either commit and every later replay of this
+            # key would be ambiguous.  Both ways out report the published commit,
+            # with no second sidecar and no second audit event.
+            recovered = any(outcome.is_superseded for outcome in outcomes)
+            if manifest.manifest_id == prior_replay[0].manifest_id or not recovered:
+                return await self._replay_outcome(prior_replay, prepared)
         sidecar_relative = f"{SIDECAR_STORAGE_PREFIX}/{first.request.run_id}/{manifest.manifest_id}.json"
         sidecar_path = self._prepared_file_path(first.workspace_root, sidecar_relative)
         published = self._publish_sidecar_locked(manifest, sidecar_path)

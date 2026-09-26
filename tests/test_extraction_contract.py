@@ -17,17 +17,18 @@ Fixture rules observed throughout:
   acceptance gate plus the frozen registry conformance are Stage 3 obligations
   (see the coverage note in the repair report).
 
-Stage-1 batch shape, recorded here so no test implies otherwise: E1 commits one
-record per ``ACQ-`` manifest (``DUPLICATE_STUDY_CONFLICT`` plus one staged
-document per request), and an E2 batch must share one acquisition manifest, one
-requested engine, and one screening parent.  Two consequences are pinned by real
-tests rather than by assumption: a *native* multi-document sidecar is still not
-producible at Stage 1, but a *mixed* batch is -- ``test_e2_neg_014_mixed_batch``
+Stage-1 batch shape, recorded here so no test implies otherwise: an E2 batch must
+share one acquisition manifest, one requested engine, and one screening parent, and
+one ``ACQ-`` manifest can hold several staged documents, so a single batch is the
+unit that produces a sidecar.  A *mixed* batch is producible at Stage 1 and is
+pinned by real tests rather than by assumption: ``test_e2_neg_014_mixed_batch``
 commits two documents from one ``ACQ-`` manifest so the batch is PARTIAL, and
 ``test_e2_neg_014_mixed_set`` exercises the mixed-set behaviour where the
 packet's other blocker lives, the candidate builder/validator, over three
 genuinely committed outcomes (one VALID, one provider-attempt FAILED, one
-NEEDS_OCR) assembled by the test rather than by a batch.
+NEEDS_OCR) assembled by the test rather than by a batch.  Whether every document
+in a batch commits is an outcome, not a shape, so both a one-record sidecar and a
+two-record one are real.
 """
 
 from __future__ import annotations
@@ -1837,6 +1838,339 @@ def test_e2_neg_014_mixed_batch_partially_commits_and_replays_without_re_extract
     service.verify_manifest(manifest, verify_bytes=True)
 
 
+def test_e2_neg_018d_repaired_mixed_batch_supersedes_the_failed_sibling(
+    tmp_path: Path,
+) -> None:
+    """Limb D of E2-NEG-018: a repair rerun of a *byte-bearing* commit succeeds.
+
+    ``neg_018c`` pins the all-failure successor, where the first commit anchored no
+    ``EXT-`` identity.  This is the same section 6.7(9) successor over the harder
+    starting point the reviewer named: the first run committed ``STU-a`` and
+    *determined* ``STU-b``, so the published sidecar owns bytes and the failed
+    sibling sits beside them.  Section 7.4 decides that run by the recomputed
+    ``EXT-`` id, not by the record count, so after the engine is repaired the
+    rerun must mint a **new** id rather than report the mixed commit as
+    ``REUSED``: the caller asked again precisely because the old commit was
+    incomplete for one document.
+
+    Three properties are load-bearing and asserted together:
+
+    * the repaired sibling is re-driven, so the engine *is* called -- and only for
+      that sibling, because ``STU-a``'s commit is final and is carried;
+    * the new sidecar holds exactly one byte-bearing record per document and keeps
+      the superseded failure row, referenced by the prior ``EXT-`` id, so the
+      recovery is auditable rather than a silent overwrite;
+    * a third identical run is the exact replay section 7.4 describes: no engine
+      call, no second sidecar, no second audit event.
+
+    The repair is *observable* because a real repair is.  Section 7.4 forbids
+    re-running an engine to rediscover a replay, so a rerun may only re-drive a
+    determined failure when the environment it failed in is no longer the
+    environment it is in.  This fake flips both of the facts the service can probe
+    without running it -- the engine now resolves, and it reports a new version --
+    exactly as a provider that came back up or a library that was upgraded would,
+    and the service compares those probes against the attempt provenance the
+    published sidecar already records.
+    """
+
+    workspace = make_study_workspace(tmp_path, ["STU-a", "STU-b"])
+    acquired = acquire_studies(
+        workspace, {"STU-a": pdf_bytes("A"), "STU-b": pdf_bytes("B")}
+    )
+    manifest_a, record_a = acquired["STU-a"]
+    manifest_b, record_b = acquired["STU-b"]
+    assert manifest_a.manifest_id == manifest_b.manifest_id
+
+    class RepairableEngine(FakeEngine):
+        """``STU-b`` is unreadable until ``repair()``; state, never a sleep."""
+
+        version_value: str = "1.0.0"
+        online: bool = False
+
+        def repair(self) -> None:
+            self.online = True
+            self.version_value = "1.0.1"
+
+        def version(self) -> str:
+            return self.version_value
+
+        def extract(
+            self,
+            data: bytes,
+            *,
+            grobid_url: str | None = None,
+            page_range: str | None = None,
+        ) -> EngineExtractionResult:
+            self.calls.append({"byte_length": len(data)})
+            if b"B" * 64 in data and not self.online:
+                raise EngineFailure(
+                    FallbackReason.ENGINE_UNAVAILABLE,
+                    "ENGINE_UNAVAILABLE",
+                    "the fixture engine cannot read this document",
+                )
+            return EngineExtractionResult(
+                text="Real findings follow. " * 40,
+                output_format=ExtractionOutputFormat.MARKDOWN,
+                page_count=1,
+                text_layer_present=True,
+            )
+
+    engine = RepairableEngine(ExtractionEngine.PYMUPDF)
+    audit = InMemoryAuditSink()
+    service = workspace.service(
+        EngineRegistry({ExtractionEngine.PYMUPDF: engine}),
+        audit_sink=audit,
+        fallback_order=("pymupdf",),
+    )
+    requests = [
+        workspace.extraction_request(
+            "STU-a", manifest_a, record_a, document_ids=[record_a.document_id]
+        ),
+        workspace.extraction_request(
+            "STU-b", manifest_b, record_b, document_ids=[record_b.document_id]
+        ),
+    ]
+    sidecar_root = workspace.root / "literature" / "extraction"
+
+    # Run 1: the mixed commit the repair will supersede -- one byte-bearing record
+    # beside one determined failure.
+    first = asyncio.run(service.extract(requests))
+    assert first.status is OperationStatus.PARTIAL
+    assert first.data.committed_count == 1
+    first_reference = first.data.manifest_reference
+    assert first_reference is not None
+    first_manifest = fixture_sidecar(workspace, first)
+    assert [record.document_id for record in first_manifest.records] == [
+        record_a.document_id
+    ]
+    published_first = sorted(sidecar_root.rglob("EXT-*.json"))
+    assert len(published_first) == 1
+    first_bytes = published_first[0].read_bytes()
+    assert len(audit.events) == 1
+    calls_after_first = len(engine.calls)
+    assert calls_after_first == 2, "both siblings ran once"
+
+    # The engine is repaired and the *identical* set is re-issued.
+    engine.repair()
+    second = asyncio.run(service.extract(requests))
+
+    # The engine ran again, and only for the document that had no bytes: the
+    # carried sibling must not be re-extracted, or a repair would silently
+    # re-run work whose commit is final (section 7.5).
+    assert len(engine.calls) == calls_after_first + 1, (
+        "the repair rerun re-drives exactly the determined sibling"
+    )
+
+    # A new ``EXT-`` id under the same key: neither ``REUSED`` nor a conflict.
+    assert second.status is OperationStatus.SUCCESS
+    assert second_reference_id(second) is not None
+    assert second_reference_id(second) != first_reference.manifest_id
+    second_reference = second.data.manifest_reference
+    assert second_reference is not None
+    second_manifest = fixture_sidecar(workspace, second)
+    assert second_manifest.idempotency_key == first_manifest.idempotency_key
+    assert second_manifest.manifest_id != first_manifest.manifest_id
+
+    # Exactly one byte-bearing record per document: the repaired sibling gained a
+    # record, the carried sibling did not gain a second one.
+    assert sorted(record.document_id for record in second_manifest.records) == sorted(
+        [record_a.document_id, record_b.document_id]
+    )
+    committed_b = next(
+        record
+        for record in second_manifest.records
+        if record.document_id == record_b.document_id
+    )
+    assert committed_b.extraction_status is ExtractionStatus.EXTRACTED
+    assert committed_b.extracted_path == f"extracted/{record_b.document_id}.md"
+    carried_a = next(
+        record
+        for record in second_manifest.records
+        if record.document_id == record_a.document_id
+    )
+    assert carried_a.extracted_sha256 == first_manifest.records[0].extracted_sha256
+
+    # The superseded failure stays visible, referenced by the prior ``EXT-`` id.
+    superseded = [
+        row
+        for row in second_manifest.item_outcomes
+        if row.is_superseded and row.document_id == record_b.document_id
+    ]
+    assert len(superseded) == 1
+    assert superseded[0].prior_outcome_manifest_id == first_reference.manifest_id
+    assert superseded[0].prior_outcome_status is ExtractionStatus.EXTRACTION_FAILED
+    assert superseded[0].extracted_path is None
+    # The envelope reports the current truth only: two requested, two committed.
+    assert second.data.requested_count == 2
+    assert second.data.committed_count == 2
+    assert {row.study_id for row in second.data.item_outcomes} == {"STU-a", "STU-b"}
+    candidate = second.data.candidate
+    assert isinstance(candidate, DocumentManifestCandidate)
+    assert len(candidate.payload["data"]["documents"]) == 2
+
+    # Both sidecars are on disk, both verify, the earlier one is byte-identical,
+    # and the successor added exactly one audit event.
+    published_second = sorted(sidecar_root.rglob("EXT-*.json"))
+    assert len(published_second) == 2
+    service.verify_manifest(first_manifest, verify_bytes=True)
+    service.verify_manifest(second_manifest, verify_bytes=True)
+    assert published_first[0].read_bytes() == first_bytes
+    assert len(audit.events) == 2, "one event per committed manifest, no duplicate"
+
+    # Run 3, with the repair in place: the exact replay.  No engine call, no
+    # second sidecar, no second event, and the same published commit reported.
+    calls_after_second = len(engine.calls)
+    third = asyncio.run(service.extract(requests))
+    assert len(engine.calls) == calls_after_second, "an exact replay re-runs no engine"
+    assert third.data.manifest_reference == second_reference
+    assert sorted(sidecar_root.rglob("EXT-*.json")) == published_second
+    assert len(audit.events) == 2
+    assert {row.extraction_status for row in third.data.item_outcomes} == {
+        ExtractionStatus.REUSED
+    }
+    service.verify_manifest(second_manifest, verify_bytes=True)
+
+
+def test_e2_neg_018e_a_repair_that_recovers_nothing_republishes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Limb E of E2-NEG-018: a repair rerun that recovers nothing stays a replay.
+
+    ``neg_018d`` is the recovery.  This is the other side of the same decision, and
+    it is the case that would silently break a key if the successor path were
+    written as "any re-drive mints a new ``EXT-`` id": the provider comes back up
+    but the document still will not parse, at the *same* engine version.  Nothing
+    about any document changed, so the published commit is still the current truth
+    for both of them and is re-reported -- one sidecar, one audit event, no
+    ``IDEMPOTENCY_CONFLICT`` on the next rerun.
+
+    The reason this is not a coin flip: a second same-key sidecar whose failure
+    row is not superseded by anything would leave two unsuperseded commits under
+    one key, and every later replay of that key would be genuinely ambiguous.  The
+    key must stay usable after any number of failed repairs.
+    """
+
+    workspace = make_study_workspace(tmp_path, ["STU-a", "STU-b"])
+    acquired = acquire_studies(
+        workspace, {"STU-a": pdf_bytes("A"), "STU-b": pdf_bytes("B")}
+    )
+    manifest_a, record_a = acquired["STU-a"]
+    manifest_b, record_b = acquired["STU-b"]
+    assert manifest_a.manifest_id == manifest_b.manifest_id
+
+    class StillBrokenEngine(FakeEngine):
+        """Availability and the ability to read STU-b are separate facts."""
+
+        reachable: bool = False
+        reads_b: bool = False
+
+        def repair(self) -> None:
+            self.reachable = True
+
+        def extract(
+            self,
+            data: bytes,
+            *,
+            grobid_url: str | None = None,
+            page_range: str | None = None,
+        ) -> EngineExtractionResult:
+            self.calls.append({"byte_length": len(data)})
+            if b"B" * 64 in data and not self.reads_b:
+                raise EngineFailure(
+                    FallbackReason.ENGINE_UNAVAILABLE,
+                    "ENGINE_UNAVAILABLE",
+                    "the fixture engine cannot read this document",
+                )
+            return EngineExtractionResult(
+                text="Real findings follow. " * 40,
+                output_format=ExtractionOutputFormat.MARKDOWN,
+                page_count=1,
+                text_layer_present=True,
+            )
+
+    engine = StillBrokenEngine(ExtractionEngine.PYMUPDF, version_value="7.7.7")
+    audit = InMemoryAuditSink()
+    service = workspace.service(
+        EngineRegistry({ExtractionEngine.PYMUPDF: engine}),
+        audit_sink=audit,
+        fallback_order=("pymupdf",),
+    )
+    requests = [
+        workspace.extraction_request(
+            "STU-a", manifest_a, record_a, document_ids=[record_a.document_id]
+        ),
+        workspace.extraction_request(
+            "STU-b", manifest_b, record_b, document_ids=[record_b.document_id]
+        ),
+    ]
+    sidecar_root = workspace.root / "literature" / "extraction"
+
+    first = asyncio.run(service.extract(requests))
+    assert first.status is OperationStatus.PARTIAL
+    first_reference = first.data.manifest_reference
+    assert first_reference is not None
+    first_manifest = fixture_sidecar(workspace, first)
+    published_first = sorted(sidecar_root.rglob("EXT-*.json"))
+    assert len(published_first) == 1
+    first_bytes = published_first[0].read_bytes()
+    assert len(audit.events) == 1
+    calls_after_first = len(engine.calls)
+    assert calls_after_first == 2
+
+    # The provider is reachable again, at the same version; the document is still
+    # unreadable.  The rerun re-drives the determined sibling -- the environment it
+    # failed in is not the environment it is in -- and finds the same truth.
+    engine.repair()
+    second = asyncio.run(service.extract(requests))
+    assert len(engine.calls) == calls_after_first + 1, (
+        "the determined sibling is re-driven once the provider is reachable"
+    )
+
+    # Nothing recovered, so nothing is republished: the same manifest id, the same
+    # single sidecar, byte-identical, and no second audit event.
+    assert second.status is OperationStatus.PARTIAL
+    second_reference = second.data.manifest_reference
+    assert second_reference is not None
+    assert second_reference == first_reference
+    second_manifest = fixture_sidecar(workspace, second)
+    assert second_manifest.manifest_id == first_manifest.manifest_id
+    assert [record.document_id for record in second_manifest.records] == [
+        record_a.document_id
+    ]
+    rows = {row.study_id: row for row in second.data.item_outcomes}
+    assert rows["STU-a"].extraction_status is ExtractionStatus.REUSED
+    assert rows["STU-b"].extraction_status is ExtractionStatus.EXTRACTION_FAILED
+    assert rows["STU-b"].extracted_path is None
+    assert not any(row.is_superseded for row in second_manifest.item_outcomes)
+    published_second = sorted(sidecar_root.rglob("EXT-*.json"))
+    assert published_second == published_first
+    assert published_second[0].read_bytes() == first_bytes
+    assert len(audit.events) == 1
+    service.verify_manifest(first_manifest, verify_bytes=True)
+
+    # The key is still usable.  The determined sibling is re-driven on every
+    # rerun -- the commit is frozen, so the record of the environment it failed in
+    # never clears, and a re-drive of an unrecoverable sibling is a bounded retry
+    # of one document, never a silent replay -- but it republishes nothing and
+    # never trips an ambiguity the service created for itself.
+    calls_after_second = len(engine.calls)
+    third = asyncio.run(service.extract(requests))
+    assert third.status is OperationStatus.PARTIAL
+    assert len(engine.calls) == calls_after_second + 1, (
+        "a rerun retries the unrecoverable sibling once, and only that sibling"
+    )
+    assert third.data.manifest_reference == first_reference
+    assert third.data.committed_count == 1
+    third_rows = {row.study_id: row for row in third.data.item_outcomes}
+    assert third_rows["STU-a"].extraction_status is ExtractionStatus.REUSED
+    assert third_rows["STU-b"].extraction_status is ExtractionStatus.EXTRACTION_FAILED
+    assert sorted(sidecar_root.rglob("EXT-*.json")) == published_first
+    assert len(audit.events) == 1
+    # The envelope still explains the failure it is reporting, as 7.4 requires of
+    # a replay: a re-reported PARTIAL is not a silent success.
+    assert [error.code for error in third.errors] == ["ENGINE_OUTPUT_UNUSABLE"]
+
+
 # ---------------------------------------------------------------------------
 # E2-NEG-018 -- idempotency conflict and successor accounting
 # ---------------------------------------------------------------------------
@@ -1845,7 +2179,7 @@ def test_e2_neg_014_mixed_batch_partially_commits_and_replays_without_re_extract
 def test_e2_neg_018_idempotency_conflict_never_overwrites_the_earlier_manifest(
     tmp_path: Path,
 ) -> None:
-    """The same key with a different request payload is a conflict, not a write.
+    """Limb A of E2-NEG-018: the same key with a different payload is a conflict.
 
     Packet 7.4 fixes the idempotency key to the workspace, run, acquisition
     reference, and the ``{document_id, source_sha256, requested_engine}`` set, so
@@ -1895,7 +2229,11 @@ def test_e2_neg_018_idempotency_conflict_never_overwrites_the_earlier_manifest(
 def test_e2_neg_018b_a_different_engine_is_a_different_key_not_a_conflict(
     tmp_path: Path,
 ) -> None:
-    """A changed request-side document set mints a new key, not a conflict.
+    """Limb B of E2-NEG-018: a changed request-side document set mints a new key.
+
+    A different requested engine is not a conflict either: it is a different
+    request, so it mints its own key and its own ``EXT-`` identity.  A conflict is
+    reserved for a changed payload *under* one key.
 
     Packet 7.4 puts ``requested_engine`` *inside* the key, so a different engine
     is a different key rather than "the same key with a changed payload".  The
@@ -1963,11 +2301,17 @@ def test_e2_neg_018c_repaired_rerun_publishes_a_successor_and_keeps_the_prior_ro
     requested document and not handed back as if it were current.
 
     Named ``neg_018c`` so it cannot be confused with limb A (``neg_018``,
-    same-key/different-payload conflict) or limb B (``neg_018b``, a different
-    requested engine minting a different key).  Only a sidecar that owns *no*
-    records takes the failure-to-success successor path: a byte-bearing sidecar is
-    a REUSED replay, never a successor, so a mutated or divergent commit can never
-    be superseded into a new manifest id.
+    same-key/different-payload conflict), limb B (``neg_018b``, a different
+    requested engine minting a different key), limb D (``neg_018d``, a recovery
+    over an already byte-bearing commit) or limb E (``neg_018e``, a recovery that
+    recovers nothing).  The starting point is what distinguishes this limb: only a
+    sidecar that owns *no* records has to re-drive the whole batch, because with
+    no record there is nothing to carry and nothing to reproduce its ``EXT-`` id.
+    A byte-bearing commit takes the same successor path as soon as a determined
+    sibling is re-driven and recovers (limb D), and a byte-bearing commit whose
+    documents all hold bytes is the ordinary ``REUSED`` replay.  A byte-bearing
+    commit is never superseded *as a whole*: only the document that recovered gains
+    a record, and every document keeps exactly one byte-bearing record.
     """
 
     fixture = acquired_fixture(tmp_path)
