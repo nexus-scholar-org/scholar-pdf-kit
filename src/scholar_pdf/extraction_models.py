@@ -919,7 +919,23 @@ class ExtractionItemOutcome(ExtractionModel):
                 raise ValueError(
                     "a byte-bearing outcome requires the committed file checksum"
                 )
-            if self.content_status is not project_content_status(
+            if self.extraction_status is ExtractionStatus.REUSED:
+                # A REUSED row re-reports a *committed* record, so its content
+                # status is the committed one (section 6.7 rule 6: derived from
+                # the recorded degradation reasons), not a fixed projection of
+                # REUSED -- a degraded commit must stay PARTIAL on replay
+                # instead of being silently upgraded to VALID.  The committed
+                # record itself keeps the strict projection
+                # (``coherent_record``); only the replayed row is relaxed here.
+                if self.content_status not in {
+                    DocumentContentStatus.VALID,
+                    DocumentContentStatus.PARTIAL,
+                }:
+                    raise ValueError(
+                        "a REUSED row must report the committed VALID or PARTIAL "
+                        "content status"
+                    )
+            elif self.content_status is not project_content_status(
                 self.extraction_status
             ):
                 raise ValueError("content_status must be the fixed projection")

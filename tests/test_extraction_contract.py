@@ -17,14 +17,17 @@ Fixture rules observed throughout:
   acceptance gate plus the frozen registry conformance are Stage 3 obligations
   (see the coverage note in the repair report).
 
-Stage-0 shape limit, recorded here so no test implies otherwise: E1 commits one
+Stage-1 batch shape, recorded here so no test implies otherwise: E1 commits one
 record per ``ACQ-`` manifest (``DUPLICATE_STUDY_CONFLICT`` plus one staged
 document per request), and an E2 batch must share one acquisition manifest, one
-requested engine, and one screening parent.  A *natively* mixed multi-document
-sidecar is therefore not producible at Stage 1; the mixed-set behaviour is
-exercised where the packet's blocker lives -- the candidate builder/validator --
-over three genuinely committed outcomes (one VALID, one provider-attempt
-FAILED, one NEEDS_OCR), assembled by the test rather than by a batch.
+requested engine, and one screening parent.  Two consequences are pinned by real
+tests rather than by assumption: a *native* multi-document sidecar is still not
+producible at Stage 1, but a *mixed* batch is -- ``test_e2_neg_014_mixed_batch``
+commits two documents from one ``ACQ-`` manifest so the batch is PARTIAL, and
+``test_e2_neg_014_mixed_set`` exercises the mixed-set behaviour where the
+packet's other blocker lives, the candidate builder/validator, over three
+genuinely committed outcomes (one VALID, one provider-attempt FAILED, one
+NEEDS_OCR) assembled by the test rather than by a batch.
 """
 
 from __future__ import annotations
@@ -1424,6 +1427,66 @@ def test_e2_neg_016b_real_fallback_run_is_partial_with_a_reason(tmp_path: Path) 
     ExtractedDocumentRecord.model_validate(payload)
 
 
+def test_e2_neg_030_replayed_degraded_commit_reports_partial_not_valid(
+    tmp_path: Path,
+) -> None:
+    """A replayed degraded commit is ``REUSED``/``PARTIAL``, never ``VALID``.
+
+    Covers the E2-NEG-030 limb of E2-NEG-016 (PARTIAL always carries a reason):
+    the run above is real, not a fixture shortcut, so replaying it is the
+    strongest available check that the ``REUSED`` projection preserves the
+    recorded degradation.  Section 6.7 rule 6 derives ``content_status`` from the
+    recorded reasons, and section 6.1 reserves the byte-bearing statuses, so the
+    committed record, the candidate document, and the sidecar all stay ``PARTIAL``
+    while the sidecar still verifies against its own bytes.
+    """
+
+    fixture = acquired_fixture(tmp_path)
+    audit = InMemoryAuditSink()
+    service = fixture.service(
+        EngineRegistry(
+            {
+                ExtractionEngine.DOCLING: failing_engine(ExtractionEngine.DOCLING),
+                ExtractionEngine.PYMUPDF: usable_engine(),
+            }
+        ),
+        audit_sink=audit,
+    )
+    request = fixture.request(
+        requested_engine=ExtractionEngine.DOCLING, allow_fallback=True
+    )
+
+    first = asyncio.run(service.extract([request]))
+    assert first.status is OperationStatus.SUCCESS
+    committed = first.data.item_outcomes[0]
+    assert committed.content_status is DocumentContentStatus.PARTIAL
+
+    second = asyncio.run(service.extract([request]))
+    assert second.status is OperationStatus.SUCCESS
+    assert second.data.committed_count == 1
+    row = second.data.item_outcomes[0]
+    assert row.extraction_status is ExtractionStatus.REUSED
+    assert row.content_status is DocumentContentStatus.PARTIAL
+    assert row.degradation_reasons == ["ENGINE_SUBSTITUTED"]
+    assert row.extracted_path == committed.extracted_path
+
+    manifest = fixture.sidecar(second)
+    record = manifest.records[0]
+    assert record.extraction_status is ExtractionStatus.PARTIAL
+    assert record.content_status is DocumentContentStatus.PARTIAL
+    assert record.effective_engine == ExtractionEngine.PYMUPDF.value
+    assert record.degradation_reasons == ["ENGINE_SUBSTITUTED"]
+
+    candidate = second.data.candidate
+    assert isinstance(candidate, DocumentManifestCandidate)
+    assert candidate.payload["data"]["documents"][0]["content_status"] == (
+        DocumentContentStatus.PARTIAL.value
+    )
+    assert candidate.payload_sha256 == first.data.candidate.payload_sha256
+    service.verify_manifest(manifest, verify_bytes=True)
+    assert len(audit.events) == 1, "a replay is not a new decision"
+
+
 def test_e2_neg_039_needs_ocr_requires_a_reason_and_carries_no_path(
     tmp_path: Path,
 ) -> None:
@@ -1623,6 +1686,157 @@ def fixture_sidecar(workspace: StudyWorkspace, outcome: Any) -> ExtractionManife
     )
 
 
+def test_e2_neg_014_mixed_batch_partially_commits_and_replays_without_re_extracting(
+    tmp_path: Path,
+) -> None:
+    """A mixed batch is a PARTIAL envelope that explains itself, and replays clean.
+
+    Covers the E2-NEG-014 mixed-batch limb, E2-NEG-030 (structured outcomes), and
+    the E2-010 / E2-POS-002 exact-rerun rule.  One ``extract`` call over two
+    studies committed by a *single* E1 manifest: ``STU-a`` produces usable text,
+    ``STU-b`` fails deterministically.  The batch is therefore ``PARTIAL``, the
+    envelope must carry the failed sibling's diagnostic (its row warning is the
+    only explanation the row owns), the candidate must keep both documents, and
+    exactly one sidecar and one audit event may exist.  The identical rerun must
+    reuse that published commit without touching an engine again.
+    """
+
+    workspace = make_study_workspace(tmp_path, ["STU-a", "STU-b"])
+    acquired = acquire_studies(
+        workspace, {"STU-a": pdf_bytes("A"), "STU-b": pdf_bytes("B")}
+    )
+    manifest_a, record_a = acquired["STU-a"]
+    manifest_b, record_b = acquired["STU-b"]
+    # One E1 commit holding both records is what makes the mixed batch legal: a
+    # batch shares one acquisition manifest, one run, and one requested engine.
+    assert manifest_a.manifest_id == manifest_b.manifest_id
+
+    class MixedEngine(FakeEngine):
+        """Commits STU-a and fails STU-b, dispatching on the fixture's own bytes."""
+
+        def extract(
+            self,
+            data: bytes,
+            *,
+            grobid_url: str | None = None,
+            page_range: str | None = None,
+        ) -> EngineExtractionResult:
+            self.calls.append({"byte_length": len(data)})
+            if b"B" * 64 in data:
+                raise EngineFailure(
+                    FallbackReason.ENGINE_ERROR,
+                    "ENGINE_ERROR",
+                    "the fixture engine cannot read this document",
+                )
+            return EngineExtractionResult(
+                text="Real findings follow. " * 40,
+                output_format=ExtractionOutputFormat.MARKDOWN,
+                page_count=1,
+                text_layer_present=True,
+            )
+
+    engine = MixedEngine(ExtractionEngine.PYMUPDF, version_value="7.7.7")
+    audit = InMemoryAuditSink()
+    service = workspace.service(
+        EngineRegistry({ExtractionEngine.PYMUPDF: engine}),
+        audit_sink=audit,
+        fallback_order=("pymupdf",),
+    )
+    requests = [
+        workspace.extraction_request(
+            "STU-a", manifest_a, record_a, document_ids=[record_a.document_id]
+        ),
+        workspace.extraction_request(
+            "STU-b", manifest_b, record_b, document_ids=[record_b.document_id]
+        ),
+    ]
+
+    first = asyncio.run(service.extract(requests))
+
+    # A mixed batch is PARTIAL, never a silent success and never a crash: the
+    # envelope reports the committed subset *and* the diagnostic that explains it.
+    assert first.status is OperationStatus.PARTIAL
+    assert first.data.committed_count == 1
+    assert first.data.requested_count == 2
+    rows = {row.study_id: row for row in first.data.item_outcomes}
+    assert set(rows) == {"STU-a", "STU-b"}, "a failed sibling is never suppressed"
+    assert rows["STU-a"].extraction_status is ExtractionStatus.EXTRACTED
+    assert rows["STU-a"].content_status is DocumentContentStatus.VALID
+    failed = rows["STU-b"]
+    assert failed.extraction_status is ExtractionStatus.EXTRACTION_FAILED
+    assert failed.content_status is DocumentContentStatus.FAILED
+    assert failed.extracted_path is None
+    assert failed.warning is not None
+    assert failed.warning.code == "ENGINE_OUTPUT_UNUSABLE"
+    # The envelope explains the degradation; the service never returns an outcome
+    # its own envelope validator would reject after the sidecar was committed.
+    assert any(error.code == "ENGINE_OUTPUT_UNUSABLE" for error in first.errors), [
+        error.code for error in first.errors
+    ]
+
+    # The candidate is a complete account of the batch: the FAILED document is
+    # present and carries no fabricated path.
+    candidate = first.data.candidate
+    assert isinstance(candidate, DocumentManifestCandidate)
+    documents = {
+        entry["document_id"]: entry for entry in candidate.payload["data"]["documents"]
+    }
+    assert set(documents) == {record_a.document_id, record_b.document_id}
+    assert documents[record_a.document_id]["content_status"] == (
+        DocumentContentStatus.VALID.value
+    )
+    assert documents[record_a.document_id]["extracted_path"] == (
+        f"extracted/{record_a.document_id}.md"
+    )
+    assert documents[record_b.document_id]["content_status"] == (
+        DocumentContentStatus.FAILED.value
+    )
+    assert "extracted_path" not in documents[record_b.document_id]
+
+    # Exactly one sidecar, one audit event, and a sidecar that round-trips.
+    sidecars = sorted(
+        (workspace.root / "literature" / "extraction").rglob("EXT-*.json")
+    )
+    assert len(sidecars) == 1
+    manifest = ExtractionManifest.model_validate_json(
+        sidecars[0].read_text(encoding="utf-8")
+    )
+    assert manifest.operation.status == OperationStatus.PARTIAL.value
+    assert [record.document_id for record in manifest.records] == [record_a.document_id]
+    service.verify_manifest(manifest, verify_bytes=True)
+    assert len(audit.events) == 1
+
+    # The identical rerun: no engine call, no second sidecar, no second event, and
+    # a byte-identical candidate.  Section 7.4 -- an exact replay is REUSED.
+    calls_after_first = len(engine.calls)
+    second = asyncio.run(service.extract(requests))
+    assert len(engine.calls) == calls_after_first, "an exact replay re-runs no engine"
+    assert second.status is OperationStatus.PARTIAL
+    assert second.data.committed_count == 1
+    assert second.data.requested_count == 2
+    replayed = {row.study_id: row for row in second.data.item_outcomes}
+    assert replayed["STU-a"].extraction_status is ExtractionStatus.REUSED
+    assert replayed["STU-a"].content_status is DocumentContentStatus.VALID
+    # A document that owns no bytes cannot be REUSED -- section 6.1 reserves the
+    # byte-bearing statuses for a committed record -- so the determined failure is
+    # re-reported verbatim: same status, same warning, still no path.
+    assert replayed["STU-b"].extraction_status is ExtractionStatus.EXTRACTION_FAILED
+    assert replayed["STU-b"].content_status is DocumentContentStatus.FAILED
+    assert replayed["STU-b"].warning is not None
+    assert replayed["STU-b"].warning.code == "ENGINE_OUTPUT_UNUSABLE"
+    assert replayed["STU-b"].extracted_path is None
+    assert second.data.manifest_reference == first.data.manifest_reference
+    assert (
+        len(list((workspace.root / "literature" / "extraction").rglob("EXT-*.json")))
+        == 1
+    )
+    assert len(audit.events) == 1
+    assert second.data.candidate is not None
+    assert second.data.candidate.payload == candidate.payload
+    assert second.data.candidate.payload_sha256 == candidate.payload_sha256
+    service.verify_manifest(manifest, verify_bytes=True)
+
+
 # ---------------------------------------------------------------------------
 # E2-NEG-018 -- idempotency conflict and successor accounting
 # ---------------------------------------------------------------------------
@@ -1737,16 +1951,23 @@ def test_e2_neg_018b_a_different_engine_is_a_different_key_not_a_conflict(
     service.verify_manifest(second_manifest, verify_bytes=True)
 
 
-def test_e2_neg_018_repaired_rerun_publishes_a_successor_and_keeps_the_prior_row(
+def test_e2_neg_018c_repaired_rerun_publishes_a_successor_and_keeps_the_prior_row(
     tmp_path: Path,
 ) -> None:
-    """Second limb: recovery is additive and every prior row stays accounted for.
+    """Limb C of E2-NEG-018: recovery is additive and every prior row accounted for.
 
     A first run that fails publishes a sidecar with no bytes.  When the engine is
     repaired, the rerun commits a *new* manifest whose ``item_outcomes`` retains
     the superseded failure row bound to the prior manifest id, and the envelope
     reports the current truth only -- the superseded row is not counted as a
     requested document and not handed back as if it were current.
+
+    Named ``neg_018c`` so it cannot be confused with limb A (``neg_018``,
+    same-key/different-payload conflict) or limb B (``neg_018b``, a different
+    requested engine minting a different key).  Only a sidecar that owns *no*
+    records takes the failure-to-success successor path: a byte-bearing sidecar is
+    a REUSED replay, never a successor, so a mutated or divergent commit can never
+    be superseded into a new manifest id.
     """
 
     fixture = acquired_fixture(tmp_path)
@@ -1953,6 +2174,90 @@ def test_e2_neg_024b_symlinked_storage_parent_cannot_escape_the_root(
     }
     assert engine.calls == [], "an escaping destination is refused before any write"
     assert not list(outside.iterdir()), "nothing is written outside the root"
+
+
+def test_e2_neg_024c_unvalidated_escaping_or_non_regular_destination_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The containment limb that needs no symlink privilege to be meaningful.
+
+    Covers the E2-NEG-024 service-level limb.  The limb above proves the request
+    *model* refuses an escaping prefix; this one proves the *service* fails closed
+    when a hostile caller never went through the model -- a hand-built request, a
+    legacy adapter, a model that gained a field later.  ``model_copy`` is used
+    deliberately as that hostile-caller simulation: the portable-path rule is
+    bypassed on purpose, so the anchor check is the only thing standing between a
+    ``../``, absolute, drive-letter, or UNC prefix and a write outside the
+    canonical root, plus a destination that already exists as a non-regular file.
+    Every limb must report ``OperationStatus.FAILED`` with a ``None`` candidate and
+    leave no write outside the root, on any platform, without a symlink.
+    """
+
+    escaping_prefixes = (
+        "../escape",
+        "nested/../../escape",
+        "/absolute/escape",
+        "C:/escape",
+        "//server/share/escape",
+    )
+    for index, storage_prefix in enumerate(escaping_prefixes):
+        fixture = acquired_fixture(tmp_path / f"escaping-{index}")
+        engine = usable_engine()
+        outcome = asyncio.run(
+            fixture.service(EngineRegistry({ExtractionEngine.PYMUPDF: engine})).extract(
+                [
+                    fixture.request().model_copy(
+                        update={"storage_prefix": storage_prefix}
+                    )
+                ]
+            )
+        )
+        assert outcome.status is OperationStatus.FAILED, storage_prefix
+        assert outcome.data.candidate is None, storage_prefix
+        item = outcome.data.item_outcomes[0]
+        assert item.extraction_status is ExtractionStatus.FAILED, storage_prefix
+        assert item.extracted_path is None, storage_prefix
+        assert item.error is not None, storage_prefix
+        assert item.error.code in {
+            "PATH_OUTSIDE_WORKSPACE",
+            "SIDECAR_DIRECTORY_INVALID",
+            "WORKSPACE_ROOT_UNAVAILABLE",
+        }, item.error.code
+        assert not list((fixture.root / "extracted").rglob("*.md")), storage_prefix
+
+    # A pre-existing non-regular destination cannot be replaced or written through.
+    fixture = acquired_fixture(tmp_path / "occupied")
+    record = fixture.record()
+    destination = fixture.root / "extracted" / f"{record.document_id}.md"
+    destination.mkdir(parents=True)
+    (destination / "occupied").write_text("occupied", encoding="utf-8")
+    engine = usable_engine()
+    outcome = asyncio.run(
+        fixture.service(EngineRegistry({ExtractionEngine.PYMUPDF: engine})).extract(
+            [fixture.request()]
+        )
+    )
+    assert outcome.status is OperationStatus.FAILED
+    assert outcome.data.candidate is None
+    item = outcome.data.item_outcomes[0]
+    assert item.extraction_status is ExtractionStatus.FAILED
+    assert item.error is not None
+    assert item.error.code in {
+        "FILESYSTEM_ERROR",
+        "PATH_OUTSIDE_WORKSPACE",
+        "SIDECAR_DIRECTORY_INVALID",
+    }, item.error.code
+    assert (destination / "occupied").read_text(encoding="utf-8") == "occupied"
+    assert not list(destination.glob("*.md"))
+
+    # Nothing escaped, on any limb: no sibling of the root and no trace of the
+    # absolute, drive-letter, or UNC destinations.
+    assert not (tmp_path / "escape").exists()
+    assert not (tmp_path / "absolute").exists()
+    assert not (tmp_path / "nested").exists()
+    assert not list(tmp_path.rglob("escape*"))
+    assert not list(Path(fixture.root.anchor or "/").glob("server"))
+    assert len(engine.calls) == 1, "the write was refused at the commit anchor"
 
 
 def test_e2_neg_025_cross_workspace_extraction_is_rejected(tmp_path: Path) -> None:
@@ -2472,25 +2777,47 @@ def test_e2_neg_043_no_filename_url_or_regex_metadata_is_invented(
 def test_e2_neg_040_committed_content_mutation_is_not_republished(
     tmp_path: Path,
 ) -> None:
-    """Edited committed bytes are detected on replay and never re-published."""
+    """Edited committed bytes are detected on replay and never re-published.
+
+    Covers the E2-NEG-017 replay limb as well: a published sidecar whose
+    committed body no longer verifies is a fail-closed replay *rejection*, not a
+    silent re-extraction, and not an exception escaping the public API.
+    """
 
     fixture = acquired_fixture(tmp_path)
     engine = usable_engine()
     service = fixture.service(EngineRegistry({ExtractionEngine.PYMUPDF: engine}))
     first = asyncio.run(service.extract([fixture.request()]))
     manifest = fixture.sidecar(first)
-    original = fixture.extracted().read_text(encoding="utf-8")
+    # Byte-mode, not text-mode: a text write would translate newlines and the
+    # "restored" body would differ from the committed one on Windows.
+    original = fixture.extracted().read_bytes()
 
     calls_after_first = len(engine.calls)
-    truncated = fixture.extracted().read_text(encoding="utf-8")
-    fixture.extracted().write_text(truncated[: len(truncated) // 2], encoding="utf-8")
+    truncated = fixture.extracted().read_bytes()
+    fixture.extracted().write_bytes(truncated[: len(truncated) // 2])
     replay = asyncio.run(service.extract([fixture.request()]))
 
     assert len(engine.calls) == calls_after_first, "replay must not re-extract"
-    if replay.status is OperationStatus.SUCCESS:
-        item = replay.data.item_outcomes[0]
-        assert item.extraction_status is ExtractionStatus.REUSED
-    # The mutated file is reported, not adopted as current.
+    # The mutated bytes fail closed.  This assertion is unconditional: the guard
+    # it replaces was vacuous, because a body that no longer matches its recorded
+    # checksum can never produce a SUCCESS rerun -- so "assert REUSED" was dead
+    # code that asserted nothing.  The replay is refused instead.
+    assert replay.status is OperationStatus.FAILED
+    assert replay.data.manifest_reference is None
+    assert replay.data.candidate is None
+    item = replay.data.item_outcomes[0]
+    assert item.extraction_status is ExtractionStatus.FAILED
+    assert item.content_status is DocumentContentStatus.FAILED
+    assert item.stage is ExtractionStage.PREFLIGHT
+    assert item.extracted_path is None
+    assert item.error is not None
+    assert item.error.code == "REPLAY_VERIFICATION_FAILED"
+    # The earlier commit is left exactly as it was: still one sidecar, still the
+    # same manifest id, and the mutation is reported rather than adopted.
+    assert (
+        len(list((fixture.root / "literature" / "extraction").rglob("EXT-*.json"))) == 1
+    )
     with pytest.raises(ExtractionCommitError) as excinfo:
         service.verify_manifest(manifest, verify_bytes=True)
     assert excinfo.value.code in {
@@ -2498,13 +2825,32 @@ def test_e2_neg_040_committed_content_mutation_is_not_republished(
         "EXTRACTED_FILE_MUTATED",
         "EXTRACTED_CONTENT_MISMATCH",
     }
-    fixture.extracted().write_text(original, encoding="utf-8")
+
+    # Restoring the bytes makes the same rerun an *unconditional* REUSED: the
+    # published commit is adopted, with no engine call and no second sidecar.
+    fixture.extracted().write_bytes(original)
+    reused = asyncio.run(service.extract([fixture.request()]))
+    assert reused.status is OperationStatus.SUCCESS
+    assert reused.data.committed_count == 1
+    assert reused.data.item_outcomes[0].extraction_status is ExtractionStatus.REUSED
+    assert reused.data.manifest_reference == first.data.manifest_reference
+    assert len(engine.calls) == calls_after_first
+    assert (
+        len(list((fixture.root / "literature" / "extraction").rglob("EXT-*.json"))) == 1
+    )
+    service.verify_manifest(manifest, verify_bytes=True)
 
 
 def test_e2_neg_041_all_failure_batch_publishes_zero_records_and_failed_status(
     tmp_path: Path,
 ) -> None:
-    """Every document failed: explicit rows, zero records, no empty success."""
+    """Every document failed: explicit rows, zero records, no empty success.
+
+    Limb A of E2-NEG-041, and the E2-NEG-030 structured-outcome requirement the
+    P0-A repair enforces: a batch that commits part of a request is ``PARTIAL`` and
+    explains itself, and a batch that commits nothing is still an explicit, published
+    ``FAILED`` sidecar rather than a silent absence.
+    """
 
     fixture = acquired_fixture(tmp_path)
     outcome = asyncio.run(
@@ -2534,10 +2880,16 @@ def test_e2_neg_041_all_failure_batch_publishes_zero_records_and_failed_status(
     assert not list((fixture.root / "extracted").glob("*.md"))
 
 
-def test_e2_neg_041_cancelled_documents_are_accounted_not_authoritative(
+def test_e2_neg_041b_cancelled_documents_are_accounted_not_authoritative(
     tmp_path: Path,
 ) -> None:
-    """Second limb: a cancelled item is accounted for and never authoritative."""
+    """Limb B of E2-NEG-041: a cancelled item is accounted for, never authoritative.
+
+    Named ``neg_041b`` to match limb A (``neg_041``, the all-failure batch): a
+    cancelled run is still a published, explicitly reported outcome -- it claims no
+    bytes, no candidate, no effective engine, and no extraction method, because an
+    attempt that never ran is not a deterministic determination.
+    """
 
     fixture = acquired_fixture(tmp_path)
 

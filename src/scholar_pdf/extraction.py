@@ -119,7 +119,6 @@ from .extraction_models import (
     compute_extraction_idempotency_key,
     determined_outcome_method,
     extraction_method_for_engine,
-    project_content_status,
     utc_now,
 )
 from .frontmatter import (
@@ -135,10 +134,14 @@ from .frontmatter import (
 )
 
 #: The one frontmatter key section 6.6 declares "provenance only; never in the
-#: identity payload".  Two runs of the same document therefore produce the same
-#: body and the same ``extracted_sha256`` but different file bytes, so this key
-#: is the only difference that may coalesce onto the file already committed
-#: (see ``ExtractionService._coalesce_existing_extraction``).
+#: identity payload": ``extracted_at``, and nothing else.  Two runs of the same
+#: document therefore produce the same body and the same ``extracted_sha256`` but
+#: different file bytes, so this key is the only difference that may coalesce onto
+#: the file already committed (see
+#: ``ExtractionService._coalesce_existing_extraction``).  Adding a second key here
+#: is a deliberate widening of what may differ between two runs of one identity,
+#: not a refactor: it must be justified against section 6.6 and the identity
+#: payload in section 6.4.
 PROVENANCE_ONLY_FRONTMATTER_KEYS = frozenset({"extracted_at"})
 
 _LOGGER = logging.getLogger(__name__)
@@ -878,14 +881,20 @@ class PDFExtractionService:
         requested engine), while the ``EXT-`` id covers the normalized extraction
         records and therefore their outcomes.
 
-        A prior commit that shares the key is a *replay* only when its recomputed
-        ``EXT-`` id is byte-bearing and self-consistent, which is exactly the case
-        where a rerun recomputes the same id.  A prior commit that left a document
-        in a determined non-byte-bearing state (``EXTRACTION_FAILED`` /
-        ``NO_TEXT_LAYER``) is instead the section 6.7(9) **successor** case: a
-        retry may now succeed, so it must mint a new ``EXT-`` id and must never be
-        reported as ``REUSED``.  Those superseded outcomes are returned so the
-        successor commit keeps them visible by reference.
+        A prior commit that binds at least one byte is a *replay* when its
+        recomputed ``EXT-`` id is self-consistent, which is exactly the case where
+        a rerun recomputes the same id: the committed records anchor the identity,
+        so section 7.4's "report ``REUSED`` without re-running the engine" applies
+        and a determined-failure row sitting beside them stays a recorded truth of
+        the published commit rather than a pending retry.  The persisted records
+        are re-verified against their own bytes on the replay path
+        (``_replay_outcome``), so a mutated body or source still fails closed
+        instead of being reported as ``REUSED`` (E2-NEG-017 / E2-NEG-040).
+
+        A prior commit that bound *no* bytes is instead the section 6.7(9)
+        **successor** case: a retry may now succeed, so it must mint a new ``EXT-``
+        id and must never be reported as ``REUSED``.  Those superseded outcomes
+        are returned so the successor commit keeps them visible by reference.
 
         A changed non-volatile payload under an existing key remains
         ``IDEMPOTENCY_CONFLICT``, and more than one byte-bearing commit for the
@@ -947,14 +956,19 @@ class PDFExtractionService:
                     "An extraction sidecar does not recompute its own EXT- id.",
                     path=path.name,
                 )
-            superseded = self._superseded_outcomes(manifest)
-            if superseded:
-                # Section 6.7(9): a prior determined failure is not a replay, and
-                # a rerun that succeeds mints a new EXT- id under the same key.
+            if not manifest.records:
+                # Section 6.7(9) successor: this prior commit bound *no* bytes, so
+                # it anchored no ``EXT-`` identity.  A retry may now succeed, which
+                # mints a new id under the same key, so it must never be reported
+                # as ``REUSED`` nor as ``IDEMPOTENCY_CONFLICT``.  The superseded
+                # outcomes are returned so the successor commit keeps them visible
+                # by reference.
                 prior.update(
                     {
                         document: (manifest.manifest_id, outcome)
-                        for document, outcome in superseded.items()
+                        for document, outcome in self._superseded_outcomes(
+                            manifest
+                        ).items()
                     }
                 )
                 continue
@@ -1023,17 +1037,24 @@ class PDFExtractionService:
         # no longer verify (E2-NEG-017 / E2-NEG-040).
         self.verify_manifest(manifest, verify_bytes=True)
         # A replay re-reports the published commit, never a fresh extraction.  The
-        # content status is re-projected with the row: `REUSED` projects onto
-        # `VALID`, so a degraded (PARTIAL) commit cannot keep its stale PARTIAL
-        # projection on a REUSED row.  The degradation itself stays visible on
-        # `degradation_reasons`, and the authoritative committed record -- which
-        # is what the candidate is built from -- keeps its original PARTIAL
-        # content status, so the artifact payload stays byte-identical.
+        # row's ``extraction_status`` becomes ``REUSED``; its ``content_status``
+        # stays the one recorded on the *committed record* it re-reports, because
+        # section 6.7 rule 6 derives the frozen content status from the recorded
+        # degradation reasons -- re-projecting onto REUSED would silently upgrade
+        # a degraded (PARTIAL) commit to VALID while its ``degradation_reasons``
+        # survived on the same row.  The authoritative committed record, which the
+        # candidate is built from, is untouched, so the artifact payload stays
+        # byte-identical.
+        committed_status = {
+            record.document_id: record.content_status for record in manifest.records
+        }
         outcomes = [
             item.model_copy(
                 update={
                     "extraction_status": ExtractionStatus.REUSED,
-                    "content_status": project_content_status(ExtractionStatus.REUSED),
+                    "content_status": committed_status.get(
+                        item.document_id, item.content_status
+                    ),
                 }
             )
             if item.extraction_status in BYTE_BEARING_STATUSES
@@ -1124,6 +1145,9 @@ class PDFExtractionService:
         if published is None:
             return
         current = self._request_shape(request)
+        # A row with no recorded attempts committed no bytes, so there is nothing
+        # a replay could silently reuse under a different request shape: such a
+        # row needs no request-shape check.
         for attempt in published.attempts:
             if any(
                 attempt.request_shape.get(name) != current.get(name)
@@ -2302,20 +2326,34 @@ class PDFExtractionService:
         # diagnostic the sidecar recorded, plus every per-item error, so a caller
         # never has to re-derive *why* nothing committed.
         errors = list(extra_errors)
-        if status in {OperationStatus.FAILED, OperationStatus.CANCELLED}:
+        # A non-SUCCESS envelope must never be silent (the envelope validator
+        # rejects a FAILED/CANCELLED/PARTIAL envelope that explains nothing).
+        # PARTIAL belongs here too: a mixed batch commits some documents and
+        # determines others, so the sidecar records the per-item diagnostics while
+        # the envelope carries neither the batch-level error nor the per-item
+        # errors/warnings -- the caller was told a committed subset without being
+        # told *why*.  Warnings are lifted as well as errors because a determined
+        # failure is routinely reported as a warning (an unusable body, a missing
+        # text layer) and that warning is the only explanation the row carries.
+        if status in {
+            OperationStatus.FAILED,
+            OperationStatus.CANCELLED,
+            OperationStatus.PARTIAL,
+        }:
             for error in manifest.operation.errors:
                 if error not in errors:
                     errors.append(error)
             for outcome in current:
-                if outcome.error is not None and outcome.error not in errors:
-                    errors.append(outcome.error)
-            if not errors:
-                errors.append(
-                    StructuredError(
-                        code="BATCH_FAILED",
-                        message="No requested document produced usable extracted text.",
-                    )
+                for diagnostic in (outcome.error, outcome.warning):
+                    if diagnostic is not None and diagnostic not in errors:
+                        errors.append(diagnostic)
+        if not errors and status in {OperationStatus.FAILED, OperationStatus.CANCELLED}:
+            errors.append(
+                StructuredError(
+                    code="BATCH_FAILED",
+                    message="No requested document produced usable extracted text.",
                 )
+            )
         return ExtractionBatchOutcome(
             run_id=manifest.run_id,
             status=status,
@@ -2571,7 +2609,15 @@ class PDFExtractionService:
     def _safe_workspace_path(self, root: Path, relative: str, *, create: bool) -> Path:
         try:
             return self._acquisition._safe_workspace_path(root, relative, create=create)
-        except AcquisitionPreflightError as error:
+        except (AcquisitionPreflightError, OSError, ValueError) as error:
+            # E1 refuses an escaping or non-portable path.  A bare ``ValueError``
+            # from the portable-path rule is containment evidence too, not a
+            # crash: when such a path reaches the commit path without having
+            # passed the request model -- a hand-built request, a legacy
+            # adapter, a field the model gained later -- it becomes the same
+            # structured per-item commit failure, so the batch reports FAILED
+            # with a candidate of None instead of an unstructured exception
+            # escaping the public API.
             raise ExtractionCommitError(
                 "PATH_OUTSIDE_WORKSPACE",
                 "A workspace path component cannot be safely anchored.",

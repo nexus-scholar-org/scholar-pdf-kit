@@ -4,14 +4,15 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - 'scholar-pdf-kit/**'
-      - 'slr-search-kit/**'
-      - '.github/workflows/scholar-pdf-kit-ci.yml'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/**'
   pull_request:
     branches: [ "main" ]
     paths:
-      - 'scholar-pdf-kit/**'
-      - 'slr-search-kit/**'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/**'
 
 jobs:
   test:
@@ -34,11 +35,9 @@ jobs:
       run: uv python install ${{ matrix.python-version }}
 
     - name: Install dependencies
-      working-directory: ./scholar-pdf-kit
       run: |
         uv pip install -e .[dev]
 
     - name: Run pytest
-      working-directory: ./scholar-pdf-kit
       run: |
         uv run pytest tests/ -v

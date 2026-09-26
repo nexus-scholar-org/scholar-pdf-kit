@@ -66,7 +66,13 @@ print("child completed without crashing", file=sys.stderr)
 def test_e2_pos_002_exact_rerun_is_idempotent_and_never_re_extracts(
     tmp_path: Path,
 ) -> None:
-    """E2-POS-002: the sidecar is the commit marker and a rerun reuses it."""
+    """E2-POS-002: the sidecar is the commit marker and a rerun reuses it.
+
+    Also the E2-NEG-045 limb for the rerun itself: the identical rerun is the
+    section 7.4 REUSED path, so the atomicity property -- one sidecar, no second
+    run directory, no partially visible state -- holds for the replay as well as
+    for the first run.
+    """
 
     fixture = acquired_fixture(tmp_path)
     engine = usable_engine()
@@ -113,26 +119,38 @@ def test_e2_neg_029_crash_before_sidecar_leaves_no_authoritative_output(
 def test_e2_neg_029b_fault_injection_leaves_no_partial_sidecar(
     tmp_path: Path,
 ) -> None:
-    """E2-NEG-029: an abort before publication leaves no sidecar and no litter.
+    """E2-NEG-029 plus the kit limb of E2-NEG-023: an abort publishes nothing.
 
     The injected fault raises, exactly as a real abort would; what matters is
-    that the workspace is left with no half-published claim.
+    that the workspace is left with no half-published claim.  Limb A injects at
+    ``ENGINE``, before any result exists.  Limb B injects at ``VALIDATION`` --
+    after the engine returned usable text but before the commit -- which is the
+    E2-NEG-023 window "between extraction success and candidate construction":
+    the candidate is never built, so nothing is published and no candidate id
+    exists anywhere for a caller to mistake for a decision.
     """
 
     fixture = acquired_fixture(tmp_path)
 
-    def die(point: ExtractionFault, identity: str) -> None:
-        if point is ExtractionFault.ENGINE:
-            raise RuntimeError("injected engine crash")
+    for point in (ExtractionFault.ENGINE, ExtractionFault.VALIDATION):
 
-    service = fixture.service(
-        _registry(), fault_injector=die, audit_sink=InMemoryAuditSink()
-    )
-    with pytest.raises(RuntimeError):
-        asyncio.run(service.extract([fixture.request()]))
+        def die(
+            injected: ExtractionFault, identity: str, _point: ExtractionFault = point
+        ) -> None:
+            if injected is _point:
+                raise RuntimeError("injected extraction crash")
 
-    assert not list((fixture.root / "literature" / "extraction").rglob("EXT-*.json"))
-    assert not list((fixture.root / "extracted").glob("*.tmp"))
+        service = fixture.service(
+            _registry(), fault_injector=die, audit_sink=InMemoryAuditSink()
+        )
+        with pytest.raises(RuntimeError):
+            asyncio.run(service.extract([fixture.request()]))
+
+        assert not list(
+            (fixture.root / "literature" / "extraction").rglob("EXT-*.json")
+        )
+        assert not list((fixture.root / "extracted").glob("*.tmp"))
+        assert not list((fixture.root / "extracted").glob("*.md"))
 
 
 def test_e2_neg_009_sidecar_verification_detects_field_mutation(
@@ -337,9 +355,15 @@ def test_e2_pos_004_clean_isolated_wheel_import_and_help(tmp_path: Path) -> None
     entrypoint = scripts_directory / (
         "scholar-pdf.exe" if os.name == "nt" else "scholar-pdf"
     )
+    # E2-NEG-031 (kit half) / E2-NEG-032 (parity half) / E2-POS-004: every help
+    # surface answers 0 from the clean wheel.  The legacy ``extract`` command has
+    # no ``--audit-logger`` -- it has no logger at all -- so its contract is the
+    # header that marks it non-authoritative; the E2 subcommand is the one that
+    # must advertise the logger.
     for arguments, expected in (
         (["--help"], "extract-run"),
         (["extract-run", "--help"], "--audit-logger"),
+        (["extract", "--help"], "NON-AUTHORITATIVE"),
     ):
         result = run([str(entrypoint), *arguments], cwd=tmp_path, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
