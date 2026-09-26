@@ -7,12 +7,16 @@ on:
       - 'src/**'
       - 'tests/**'
       - '.github/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
   pull_request:
     branches: [ "main" ]
     paths:
       - 'src/**'
       - 'tests/**'
       - '.github/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
 
 jobs:
   test:
