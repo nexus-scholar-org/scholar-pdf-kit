@@ -31,7 +31,21 @@ extract = [
     "requests",
     "lxml"
 ]
-search = ["scholar-search-kit"]
+# E3/T-110b source decoupling: the relative editable
+# `[tool.uv.sources] scholar-search-kit = { path = "../scholar-search-kit" }`
+# entry only resolves inside the Nexus Scholar monorepo. For a standalone
+# `uv pip install scholar-pdf-kit[search]` the wheel METADATA carried a bare
+# `Requires-Dist: scholar-search-kit`, so the optional runtime sibling could not
+# be resolved outside the monorepo (and the relative path is unresolvable for a
+# git checkout of this kit alone). The sibling is therefore declared as a PEP 508
+# direct git reference pinned to the canonical scholar-search-kit main commit,
+# which is the standalone carrier, exactly like the T-110 declared-dependency
+# pattern. `[tool.uv.sources]` is removed entirely.
+#
+# NOTE: this is an *optional* extra, so it is absent from the base
+# `project.dependencies`; `tests/test_standalone_packaging.py` therefore asserts
+# over dependencies AND optional-dependencies.
+search = ["scholar-search-kit @ git+https://github.com/nexus-scholar-org/scholar-search-kit@911d864fcb6a706d4c0339f80524a46f591e2cad"]
 
 [project.scripts]
 scholar-pdf = "scholar_pdf.cli:app"
@@ -39,8 +53,15 @@ scholar-pdf = "scholar_pdf.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/scholar_pdf"]
 
+# A `project.optional-dependencies` entry that is a PEP 508 direct reference (the
+# scholar-search-kit git pin in the `search` extra above) is only accepted by
+# hatchling when the backend is explicitly opted in. Pre-existing in this repo,
+# and required by the `search` extra direct ref above.
+#
+# Consequence, deliberate: the resulting wheel is NOT uploadable to PyPI
+# (PEP 508 direct references are forbidden by the index). These kits are
+# distributed from their canonical git repositories, and every consumer pins a
+# full commit SHA, so a git-only distribution model is intended, not a
+# limitation.
 [tool.hatch.metadata]
 allow-direct-references = true
-
-[tool.uv.sources]
-scholar-search-kit = { path = "../scholar-search-kit", editable = true }
