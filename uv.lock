@@ -2928,7 +2928,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.31.0" },
     { name = "requests", marker = "extra == 'extract'" },
     { name = "rich", specifier = ">=13.0.0" },
-    { name = "scholar-search-kit", marker = "extra == 'search'", editable = "../scholar-search-kit" },
+    { name = "scholar-search-kit", marker = "extra == 'search'", git = "https://github.com/nexus-scholar-org/scholar-search-kit?rev=911d864fcb6a706d4c0339f80524a46f591e2cad" },
     { name = "tenacity", specifier = ">=8.0.0" },
     { name = "typer", specifier = ">=0.9.0" },
     { name = "vcrpy", marker = "extra == 'dev'", specifier = ">=5.0.0" },
@@ -2938,7 +2938,7 @@ provides-extras = ["dev", "extract", "search"]
 [[package]]
 name = "scholar-search-kit"
 version = "0.1.0"
-source = { editable = "../scholar-search-kit" }
+source = { git = "https://github.com/nexus-scholar-org/scholar-search-kit?rev=911d864fcb6a706d4c0339f80524a46f591e2cad#911d864fcb6a706d4c0339f80524a46f591e2cad" }
 dependencies = [
     { name = "hishel" },
     { name = "httpx" },
@@ -2947,20 +2947,6 @@ dependencies = [
     { name = "rich" },
     { name = "typer" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "hishel", specifier = "==0.0.32" },
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pydantic-settings", specifier = ">=2.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
-    { name = "rich", specifier = ">=13.9.4" },
-    { name = "typer", specifier = ">=0.9.0" },
-    { name = "vcrpy", marker = "extra == 'dev'", specifier = ">=5.0.0" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "scipy"
